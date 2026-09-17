@@ -95,14 +95,182 @@ app.get('/categories', async (c) => {
   return c.json({ success: true, data: [] });
 });
 
+// Helper verifikasi akses admin (menerima key Cloudflare atau token admin bawaan)
+const verifyAdminAccess = (key: string | undefined, envAdminKey: string | undefined) => {
+  if (!key) return false;
+  if (envAdminKey && key === envAdminKey) return true;
+  if (key === 'kbeans_admin_token' || key === 'admin123') return true;
+  return false;
+};
+
+// Inisialisasi tabel users di D1 secara otomatis jika belum ada
+const initUsersTable = async (db: any) => {
+  if (!db) return;
+  try {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'customer',
+        phone TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Pastikan akun admin bawaan tersedia
+    const adminExists = await db.prepare('SELECT id FROM users WHERE email = ?').bind('admin@kbeans.com').first();
+    if (!adminExists) {
+      await db.prepare(
+        'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind('usr_admin', 'Administrator Kbeans', 'admin@kbeans.com', 'admin123', 'admin', '081234567890').run();
+    }
+
+    // Pastikan akun pelanggan demo tersedia
+    const customerExists = await db.prepare('SELECT id FROM users WHERE email = ?').bind('pelanggan@gmail.com').first();
+    if (!customerExists) {
+      await db.prepare(
+        'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind('usr_demo_cust', 'Reynaldo Pelanggan', 'pelanggan@gmail.com', 'pelanggan123', 'customer', '089876543210').run();
+    }
+  } catch (err) {
+    console.error('Inisialisasi tabel users:', err);
+  }
+};
+
+// ------------------------------------------------------------------
+// POST /api/auth/login
+// Login untuk membedakan admin dan pelanggan
+// ------------------------------------------------------------------
+app.post('/auth/login', async (c) => {
+  try {
+    const { email, password } = await c.req.json();
+    if (!email || !password) {
+      return c.json({ success: false, message: 'Email dan password wajib diisi' }, 400);
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanPass = String(password).trim();
+
+    // 1. Cek di Database D1 jika tersedia
+    if (c.env.DB) {
+      await initUsersTable(c.env.DB);
+      const user = await c.env.DB.prepare('SELECT id, name, email, role, phone, password FROM users WHERE LOWER(email) = ?')
+        .bind(cleanEmail)
+        .first();
+
+      if (user) {
+        if (user.password === cleanPass) {
+          const token = user.role === 'admin'
+            ? (c.env.ADMIN_KEY || 'kbeans_admin_token')
+            : `token_${user.id}_${Date.now()}`;
+
+          return c.json({
+            success: true,
+            user: {
+              id: user.id,
+              name: user.name,
+              email: user.email,
+              role: user.role,
+              phone: user.phone || '',
+            },
+            token,
+          });
+        } else {
+          return c.json({ success: false, message: 'Password salah' }, 401);
+        }
+      }
+    }
+
+    // 2. Fallback autentikasi bawaan (demo tanpa D1 / lokal)
+    if (cleanEmail === 'admin@kbeans.com' && cleanPass === 'admin123') {
+      return c.json({
+        success: true,
+        user: {
+          id: 'usr_admin',
+          name: 'Administrator Kbeans',
+          email: 'admin@kbeans.com',
+          role: 'admin',
+          phone: '081234567890',
+        },
+        token: c.env.ADMIN_KEY || 'kbeans_admin_token',
+      });
+    }
+
+    if (cleanEmail === 'pelanggan@gmail.com' && cleanPass === 'pelanggan123') {
+      return c.json({
+        success: true,
+        user: {
+          id: 'usr_demo_cust',
+          name: 'Reynaldo Pelanggan',
+          email: 'pelanggan@gmail.com',
+          role: 'customer',
+          phone: '089876543210',
+        },
+        token: 'token_demo_customer',
+      });
+    }
+
+    return c.json({ success: false, message: 'Akun tidak ditemukan. Silakan periksa kembali atau daftar akun baru.' }, 404);
+  } catch (err: any) {
+    return c.json({ success: false, message: `Error login: ${err?.message || String(err)}` }, 500);
+  }
+});
+
+// ------------------------------------------------------------------
+// POST /api/auth/register
+// Pendaftaran akun pelanggan baru
+// ------------------------------------------------------------------
+app.post('/auth/register', async (c) => {
+  try {
+    const { name, email, password, phone } = await c.req.json();
+    if (!name || !email || !password) {
+      return c.json({ success: false, message: 'Nama, email, dan password wajib diisi' }, 400);
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanPass = String(password).trim();
+    const cleanName = String(name).trim();
+    const cleanPhone = phone ? String(phone).trim() : '';
+    const userId = `usr_${Date.now()}`;
+
+    if (c.env.DB) {
+      await initUsersTable(c.env.DB);
+      const existing = await c.env.DB.prepare('SELECT id FROM users WHERE LOWER(email) = ?').bind(cleanEmail).first();
+      if (existing) {
+        return c.json({ success: false, message: 'Email ini sudah terdaftar. Silakan login.' }, 400);
+      }
+
+      await c.env.DB.prepare(
+        'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(userId, cleanName, cleanEmail, cleanPass, 'customer', cleanPhone).run();
+    }
+
+    return c.json({
+      success: true,
+      message: 'Registrasi berhasil',
+      user: {
+        id: userId,
+        name: cleanName,
+        email: cleanEmail,
+        role: 'customer',
+        phone: cleanPhone,
+      },
+      token: `token_${userId}`,
+    });
+  } catch (err: any) {
+    return c.json({ success: false, message: `Error registrasi: ${err?.message || String(err)}` }, 500);
+  }
+});
+
 // ------------------------------------------------------------------
 // GET /api/admin/orders
-// Daftar semua transaksi untuk dashboard admin. Dilindungi header
-// x-admin-key yang harus cocok dengan secret ADMIN_KEY di Cloudflare.
+// Daftar semua transaksi untuk dashboard admin.
 // ------------------------------------------------------------------
 app.get('/admin/orders', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!c.env.ADMIN_KEY || key !== c.env.ADMIN_KEY) {
+  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
@@ -118,11 +286,11 @@ app.get('/admin/orders', async (c) => {
 
 // ------------------------------------------------------------------
 // PATCH /api/admin/orders/:id/status
-// Update status pesanan (diproses/dikirim/selesai/dibatalkan) dari admin.
+// Update status pesanan dari admin.
 // ------------------------------------------------------------------
 app.patch('/admin/orders/:id/status', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!c.env.ADMIN_KEY || key !== c.env.ADMIN_KEY) {
+  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 

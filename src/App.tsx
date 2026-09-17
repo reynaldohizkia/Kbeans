@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, ShoppingBag, Minus, Plus, MapPin, Coffee } from 'lucide-react';
+import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield } from 'lucide-react';
 
 // ----------------------------------------------------------------
 // Types
 // ----------------------------------------------------------------
+interface UserProfile {
+  id: string;
+  name: string;
+  email: string;
+  role: 'customer' | 'admin';
+  phone?: string;
+}
+
 interface Product {
   id: string;
   name: string;
@@ -63,8 +71,32 @@ export default function App() {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [cartOpen, setCartOpen] = useState(false);
   const [checkoutStep, setCheckoutStep] = useState<'cart' | 'form' | 'payment' | 'success'>('cart');
-  const [customerName, setCustomerName] = useState('');
-  const [customerPhone, setCustomerPhone] = useState('');
+  // Sesi Pengguna (Pelanggan / Admin)
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
+    try {
+      const saved = localStorage.getItem('kbeans_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [customerName, setCustomerName] = useState(() => {
+    try {
+      const saved = localStorage.getItem('kbeans_user');
+      return saved ? (JSON.parse(saved)?.name || '') : '';
+    } catch {
+      return '';
+    }
+  });
+  const [customerPhone, setCustomerPhone] = useState(() => {
+    try {
+      const saved = localStorage.getItem('kbeans_user');
+      return saved ? (JSON.parse(saved)?.phone || '') : '';
+    } catch {
+      return '';
+    }
+  });
   const [fulfillmentType, setFulfillmentType] = useState<'pickup' | 'delivery'>('pickup');
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<'qris' | 'bca_va' | 'credit_card'>('qris');
@@ -76,6 +108,14 @@ export default function App() {
   const [chargeError, setChargeError] = useState('');
   const [isDemoPayment, setIsDemoPayment] = useState(false);
   const [demoReason, setDemoReason] = useState('');
+
+  const handleLogout = () => {
+    localStorage.removeItem('kbeans_user');
+    localStorage.removeItem('kbeans_admin_key');
+    setCurrentUser(null);
+    setCustomerName('');
+    setCustomerPhone('');
+  };
 
   useEffect(() => {
     Promise.all([
@@ -249,21 +289,61 @@ export default function App() {
       {/* ---------- Header ---------- */}
       <header className="sticky top-0 z-30 border-b border-[#3A2A1E] bg-[#1C1410]/95 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-          <div className="font-serif text-2xl tracking-tight text-[#F0E6D8]">
+          <a href="/" className="flex items-center gap-2 font-serif text-2xl tracking-tight text-[#F0E6D8]">
+            <Coffee size={24} className="text-[#C99A3D]" />
             Kbeans
-          </div>
-          <button
-            onClick={() => setCartOpen(true)}
-            className="relative flex items-center gap-2 rounded-full border border-[#3A2A1E] px-4 py-2 text-sm text-[#F0E6D8] transition hover:border-[#C99A3D]"
-          >
-            <ShoppingBag size={16} />
-            Keranjang
-            {cartCount > 0 && (
-              <span className="ml-1 flex h-5 w-5 items-center justify-center rounded-full bg-[#C99A3D] text-xs font-medium text-[#1C1410]">
-                {cartCount}
-              </span>
+          </a>
+
+          <div className="flex items-center gap-3">
+            {currentUser ? (
+              <div className="flex items-center gap-2">
+                {currentUser.role === 'admin' ? (
+                  <a
+                    href="/admin"
+                    className="flex items-center gap-1.5 rounded-full border border-[#C99A3D]/40 bg-[#C99A3D]/10 px-3 py-1.5 text-xs font-medium text-[#C99A3D] transition hover:bg-[#C99A3D]/20"
+                  >
+                    <Shield size={13} />
+                    Panel Admin
+                  </a>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-xs text-[#B8A896]">
+                    <User size={14} className="text-[#C99A3D]" />
+                    <span className="hidden sm:inline">Halo,</span>
+                    <strong className="font-medium text-[#F0E6D8]">{currentUser.name.split(' ')[0]}</strong>
+                  </span>
+                )}
+                <button
+                  onClick={handleLogout}
+                  title="Keluar dari akun"
+                  className="flex items-center gap-1 rounded-full border border-[#3A2A1E] px-2.5 py-1.5 text-xs text-[#B8A896] transition hover:border-red-500/40 hover:text-red-400"
+                >
+                  <LogOut size={13} />
+                  <span className="hidden sm:inline">Keluar</span>
+                </button>
+              </div>
+            ) : (
+              <a
+                href="/login"
+                className="flex items-center gap-1.5 rounded-full border border-[#3A2A1E] px-3.5 py-1.5 text-xs text-[#F0E6D8] transition hover:border-[#C99A3D] hover:text-[#C99A3D]"
+              >
+                <User size={14} />
+                Masuk
+              </a>
             )}
-          </button>
+
+            <button
+              onClick={() => setCartOpen(true)}
+              className="relative flex items-center gap-2 rounded-full border border-[#3A2A1E] px-4 py-1.5 text-xs sm:text-sm text-[#F0E6D8] transition hover:border-[#C99A3D]"
+            >
+              <ShoppingBag size={15} />
+              <span className="hidden sm:inline">Keranjang</span>
+              {cartCount > 0 && (
+                <span className="ml-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-[#C99A3D] text-[11px] font-medium text-[#1C1410]">
+                  {cartCount}
+                </span>
+              )}
+            </button>
+          </div>
         </div>
       </header>
 
