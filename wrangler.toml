@@ -1,0 +1,13 @@
+name = "kbeans"
+compatibility_date = "2024-09-23"
+pages_build_output_dir = "dist"
+
+# Binding Database D1 Relasional
+[[d1_databases]]
+binding = "DB"
+database_name = "kbeans-db"
+database_id = "60710ba5-172e-489c-a091-2697f6b2a301"
+
+# Binding Cloudflare Workers AI
+[ai]
+binding = "AI"
