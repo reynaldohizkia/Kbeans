@@ -70,6 +70,7 @@ export default function App() {
   const [paymentMethod, setPaymentMethod] = useState<'qris' | 'bca_va' | 'credit_card'>('qris');
   const [placingOrder, setPlacingOrder] = useState(false);
   const [order, setOrder] = useState<{ order_id: string; order_number: string; total_amount: number } | null>(null);
+  const [confirmingPayment, setConfirmingPayment] = useState(false);
   const [qrUrl, setQrUrl] = useState('');
   const [vaNumber, setVaNumber] = useState('');
   const [chargeError, setChargeError] = useState('');
@@ -196,6 +197,25 @@ export default function App() {
     }, 4000);
     return () => clearInterval(interval);
   }, [checkoutStep, order, paymentMethod]);
+
+  // Jalur cadangan sementara selagi menunggu aktivasi channel Midtrans --
+  // menandai pesanan lunas secara manual tanpa lewat Midtrans sungguhan.
+  const confirmPayment = async () => {
+    if (!order) return;
+    setConfirmingPayment(true);
+    try {
+      await fetch('/api/midtrans/simulate-payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: order.order_id }),
+      });
+      setCheckoutStep('success');
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setConfirmingPayment(false);
+    }
+  };
 
   const resetCheckout = () => {
     setCart([]);
@@ -547,6 +567,21 @@ export default function App() {
                 >
                   Ganti Metode Pembayaran
                 </button>
+              </div>
+            )}
+
+            {checkoutStep === 'payment' && paymentMethod !== 'credit_card' && (
+              <div className="space-y-3 border-t border-[#3A2A1E] px-6 py-5">
+                <button
+                  onClick={confirmPayment}
+                  disabled={confirmingPayment}
+                  className="w-full rounded-full bg-[#C99A3D] py-3 text-sm font-medium text-[#1C1410] transition hover:bg-[#DBAE55] disabled:opacity-50"
+                >
+                  {confirmingPayment ? 'Memproses...' : 'Simulasikan Pembayaran Berhasil'}
+                </button>
+                <p className="text-center text-[11px] text-[#8A7A68]">
+                  * Mode cadangan sementara -- dipakai selagi menunggu aktivasi channel Midtrans.
+                </p>
               </div>
             )}
 
