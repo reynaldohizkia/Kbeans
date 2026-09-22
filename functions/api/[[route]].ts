@@ -403,6 +403,7 @@ app.post('/midtrans/charge', async (c) => {
         success: true,
         is_demo: true,
         demo_reason: reason,
+        debug_payment_method_received: payment_method,
         qr_url: demoQrUrl,
         va_number: demoVa,
         midtrans_order_id: midtransOrderId,
