@@ -438,7 +438,7 @@ app.post('/midtrans/charge', async (c) => {
 
     if (payment_method === 'bca_va') {
       payload.payment_type = 'bank_transfer';
-      payload.bank_transfer = { bank: 'bca' };
+      payload.bank_transfer = { bank: 'permata' };
     } else {
       // Default QRIS dengan fallback gopay
       payload.payment_type = 'qris';
