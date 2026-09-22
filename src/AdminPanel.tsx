@@ -86,26 +86,50 @@ export default function AdminPanel() {
           >
             {loading ? 'Memeriksa...' : 'Masuk'}
           </button>
+          <div className="mt-4 flex justify-between border-t border-[#3A2A1E] pt-4 text-xs text-[#B8A896]">
+            <a href="/login" className="hover:text-[#C99A3D]">Masuk via /login</a>
+            <a href="/" className="hover:text-[#F0E6D8]">Kembali ke Toko</a>
+          </div>
         </div>
       </div>
     );
   }
 
+  const handleLogout = () => {
+    localStorage.removeItem('kbeans_admin_key');
+    localStorage.removeItem('kbeans_user');
+    window.location.href = '/login';
+  };
+
   // ---------- Dashboard transaksi ----------
   return (
     <div className="min-h-screen bg-[#1C1410] p-6 font-sans text-[#F0E6D8]">
       <div className="mx-auto max-w-6xl">
-        <div className="mb-6 flex items-center justify-between">
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="font-serif text-2xl">Kbeans — Daftar Transaksi</h1>
+            <h1 className="font-serif text-2xl">Kbeans — Panel Admin</h1>
             <p className="text-sm text-[#B8A896]">{orders.length} pesanan tercatat</p>
           </div>
-          <button
-            onClick={() => loadOrders(adminKey)}
-            className="rounded-full border border-[#3A2A1E] px-4 py-1.5 text-sm hover:border-[#C99A3D]"
-          >
-            {loading ? 'Memuat...' : 'Refresh'}
-          </button>
+          <div className="flex items-center gap-2">
+            <a
+              href="/"
+              className="rounded-full border border-[#3A2A1E] px-4 py-1.5 text-xs text-[#B8A896] hover:border-[#C99A3D] hover:text-[#F0E6D8]"
+            >
+              Lihat Toko
+            </a>
+            <button
+              onClick={() => loadOrders(adminKey)}
+              className="rounded-full border border-[#3A2A1E] px-4 py-1.5 text-xs hover:border-[#C99A3D]"
+            >
+              {loading ? 'Memuat...' : 'Refresh'}
+            </button>
+            <button
+              onClick={handleLogout}
+              className="rounded-full border border-red-500/30 bg-red-500/10 px-4 py-1.5 text-xs text-red-400 hover:bg-red-500/20"
+            >
+              Keluar
+            </button>
+          </div>
         </div>
 
         <div className="overflow-x-auto rounded-xl border border-[#3A2A1E]">
