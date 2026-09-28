@@ -22,20 +22,21 @@ const formatRupiah = (n: number) =>
 
 export default function AdminPanel() {
   const [adminKey, setAdminKey] = useState(localStorage.getItem('kbeans_admin_key') || '');
-  const [inputKey, setInputKey] = useState('');
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [loadError, setLoadError] = useState('');
 
   const loadOrders = async (key: string) => {
     setLoading(true);
-    setError('');
+    setLoadError('');
     try {
       const res = await fetch('/api/admin/orders', { headers: { 'x-admin-key': key } });
       if (res.status === 401) {
-        setError('Admin key salah.');
+        setLoadError('Sesi admin tidak valid. Silakan login ulang.');
         localStorage.removeItem('kbeans_admin_key');
+        localStorage.removeItem('kbeans_user');
         setAdminKey('');
+        setTimeout(() => { window.location.href = '/login'; }, 1500);
         return;
       }
       const data = await res.json();
@@ -43,7 +44,7 @@ export default function AdminPanel() {
       localStorage.setItem('kbeans_admin_key', key);
       setAdminKey(key);
     } catch {
-      setError('Gagal memuat data. Cek koneksi internet kamu.');
+      setLoadError('Gagal memuat data. Cek koneksi internet kamu.');
     } finally {
       setLoading(false);
     }
@@ -63,33 +64,47 @@ export default function AdminPanel() {
     loadOrders(adminKey);
   };
 
-  // ---------- Layar login admin ----------
-  if (!adminKey) {
+  // Cek apakah sudah login sebagai admin via halaman /login
+  const userStr = localStorage.getItem('kbeans_user');
+  const userObj = userStr ? (() => { try { return JSON.parse(userStr); } catch { return null; } })() : null;
+
+  // Jika adminKey tidak ada (belum login lewat halaman login baru),
+  // tapi user di localStorage adalah admin, maka gunakan token demo
+  useEffect(() => {
+    if (!adminKey && userObj?.role === 'admin') {
+      const demoToken = 'kbeans_admin_token';
+      localStorage.setItem('kbeans_admin_key', demoToken);
+      setAdminKey(demoToken);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- Redirect ke /login jika belum login ----------
+  if (!adminKey && userObj?.role !== 'admin') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#1C1410] px-4 font-sans text-[#F0E6D8]">
-        <div className="w-full max-w-sm rounded-2xl border border-[#3A2A1E] bg-[#221812] p-6">
-          <h1 className="mb-1 font-serif text-2xl">Kbeans Admin</h1>
-          <p className="mb-4 text-sm text-[#B8A896]">Masukkan admin key untuk melihat transaksi.</p>
-          <input
-            type="password"
-            value={inputKey}
-            onChange={(e) => setInputKey(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && loadOrders(inputKey)}
-            placeholder="Admin key"
-            className="mb-3 w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3 py-2 text-sm outline-none focus:border-[#C99A3D]"
-          />
-          {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
-          <button
-            onClick={() => loadOrders(inputKey)}
-            disabled={loading}
-            className="w-full rounded-full bg-[#C99A3D] py-2 text-sm font-medium text-[#1C1410] disabled:opacity-50"
-          >
-            {loading ? 'Memeriksa...' : 'Masuk'}
-          </button>
-          <div className="mt-4 flex justify-between border-t border-[#3A2A1E] pt-4 text-xs text-[#B8A896]">
-            <a href="/login" className="hover:text-[#C99A3D]">Masuk via /login</a>
-            <a href="/" className="hover:text-[#F0E6D8]">Kembali ke Toko</a>
+      <div className="flex min-h-screen flex-col items-center justify-center bg-[#1C1410] px-4 font-sans text-[#F0E6D8]">
+        <div className="mb-6 flex flex-col items-center gap-3 text-center">
+          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#C99A3D]/15">
+            <span className="text-3xl">🔐</span>
           </div>
+          <h1 className="font-serif text-2xl">Akses Admin Kbeans</h1>
+          <p className="text-sm text-[#B8A896]">
+            Anda harus login sebagai Admin terlebih dahulu untuk membuka halaman ini.
+          </p>
+        </div>
+        <div className="flex gap-3">
+          <a
+            href="/login"
+            className="rounded-full bg-[#C99A3D] px-6 py-2.5 text-sm font-medium text-[#1C1410] transition hover:bg-[#DBAE55]"
+          >
+            Masuk ke Admin
+          </a>
+          <a
+            href="/"
+            className="rounded-full border border-[#3A2A1E] px-6 py-2.5 text-sm text-[#B8A896] transition hover:border-[#C99A3D] hover:text-[#F0E6D8]"
+          >
+            Ke Toko
+          </a>
         </div>
       </div>
     );
@@ -133,6 +148,11 @@ export default function AdminPanel() {
         </div>
 
         <div className="overflow-x-auto rounded-xl border border-[#3A2A1E]">
+          {loadError && (
+            <div className="border-b border-red-500/20 bg-red-500/10 px-4 py-3 text-xs text-red-400">
+              {loadError}
+            </div>
+          )}
           <table className="w-full text-left text-sm">
             <thead className="bg-[#221812] text-[#B8A896]">
               <tr>
