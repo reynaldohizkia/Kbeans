@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Settings, Check, Copy, X, Key, ShieldCheck, AlertCircle } from 'lucide-react';
 
 interface Order {
   id: string;
@@ -25,6 +26,15 @@ export default function AdminPanel() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
+
+  // State Modal Pengaturan Midtrans
+  const [showConfigModal, setShowConfigModal] = useState(false);
+  const [midtransConfig, setMidtransConfig] = useState<{ has_key: boolean; masked_key: string; source: string } | null>(null);
+  const [serverKeyInput, setServerKeyInput] = useState('');
+  const [savingKey, setSavingKey] = useState(false);
+  const [configMsg, setConfigMsg] = useState('');
+  const [configErr, setConfigErr] = useState('');
+  const [copiedWebhook, setCopiedWebhook] = useState(false);
 
   const loadOrders = async (key: string) => {
     setLoading(true);
@@ -116,6 +126,58 @@ export default function AdminPanel() {
     window.location.href = '/login';
   };
 
+  const loadMidtransConfig = async () => {
+    try {
+      const res = await fetch('/api/admin/midtrans/config', { headers: { 'x-admin-key': adminKey } });
+      const data = await res.json();
+      if (data.success) {
+        setMidtransConfig(data);
+      }
+    } catch {}
+  };
+
+  const handleOpenConfigModal = () => {
+    setShowConfigModal(true);
+    setConfigMsg('');
+    setConfigErr('');
+    loadMidtransConfig();
+  };
+
+  const handleSaveMidtransKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!serverKeyInput.trim()) return;
+    setSavingKey(true);
+    setConfigMsg('');
+    setConfigErr('');
+    try {
+      const res = await fetch('/api/admin/midtrans/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
+        body: JSON.stringify({ server_key: serverKeyInput }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        setConfigErr(data.message || 'Gagal menyimpan Server Key.');
+        return;
+      }
+      setConfigMsg(data.message || 'Berhasil disimpan!');
+      setServerKeyInput('');
+      loadMidtransConfig();
+    } catch {
+      setConfigErr('Koneksi gagal saat menghubungi server.');
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const webhookUrl = typeof window !== 'undefined' ? `${window.location.origin}/api/midtrans/notification` : '';
+  const handleCopyWebhook = () => {
+    if (!webhookUrl) return;
+    navigator.clipboard.writeText(webhookUrl);
+    setCopiedWebhook(true);
+    setTimeout(() => setCopiedWebhook(false), 2000);
+  };
+
   // ---------- Dashboard transaksi ----------
   return (
     <div className="min-h-screen bg-[#1C1410] p-6 font-sans text-[#F0E6D8]">
@@ -125,7 +187,14 @@ export default function AdminPanel() {
             <h1 className="font-serif text-2xl">Kbeans — Panel Admin</h1>
             <p className="text-sm text-[#B8A896]">{orders.length} pesanan tercatat</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleOpenConfigModal}
+              className="flex items-center gap-1.5 rounded-full border border-[#C99A3D]/50 bg-[#C99A3D]/10 px-3.5 py-1.5 text-xs font-medium text-[#C99A3D] transition hover:bg-[#C99A3D] hover:text-[#1C1410]"
+            >
+              <Settings size={13} />
+              Pengaturan Midtrans
+            </button>
             <a
               href="/"
               className="rounded-full border border-[#3A2A1E] px-4 py-1.5 text-xs text-[#B8A896] hover:border-[#C99A3D] hover:text-[#F0E6D8]"
@@ -226,6 +295,109 @@ export default function AdminPanel() {
             </tbody>
           </table>
         </div>
+
+        {/* Modal Pengaturan Midtrans */}
+        {showConfigModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="fixed inset-0 bg-black/75 backdrop-blur-xs" onClick={() => setShowConfigModal(false)} />
+            <div className="relative w-full max-w-lg rounded-2xl border border-[#3A2A1E] bg-[#221812] p-6 shadow-2xl">
+              <div className="flex items-center justify-between border-b border-[#3A2A1E] pb-4">
+                <div className="flex items-center gap-2">
+                  <Key size={18} className="text-[#C99A3D]" />
+                  <h2 className="font-serif text-lg text-[#F0E6D8]">Integrasi Midtrans (Sandbox)</h2>
+                </div>
+                <button onClick={() => setShowConfigModal(false)} className="text-[#B8A896] hover:text-[#F0E6D8]">
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-4 text-xs text-[#B8A896]">
+                {/* Status Box */}
+                <div className="rounded-xl border border-[#3A2A1E] bg-[#1C1410] p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-[#8A7A68]">Status Koneksi</p>
+                  {midtransConfig?.has_key ? (
+                    <div className="mt-2 flex items-start gap-2 text-emerald-400">
+                      <ShieldCheck size={16} className="mt-0.5 shrink-0" />
+                      <div>
+                        <p className="font-medium text-emerald-300">Terhubung ke Midtrans Sandbox</p>
+                        <p className="text-[11px] text-[#B8A896]">
+                          Server Key: <code className="font-mono text-[#F0E6D8]">{midtransConfig.masked_key}</code> ({midtransConfig.source})
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-2 flex items-start gap-2 text-amber-400">
+                      <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                      <div>
+                        <p className="font-medium text-amber-300">Belum Terhubung (Mode Demo Simulasi)</p>
+                        <p className="text-[11px] text-[#B8A896]">
+                          Masukkan Server Key Midtrans di bawah ini untuk mengaktifkan QRIS dan VA Midtrans nyata.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Form Input Server Key */}
+                <form onSubmit={handleSaveMidtransKey} className="space-y-3">
+                  <div>
+                    <label className="mb-1 block font-medium text-[#F0E6D8]">
+                      Midtrans Server Key
+                    </label>
+                    <input
+                      type="text"
+                      value={serverKeyInput}
+                      onChange={(e) => setServerKeyInput(e.target.value)}
+                      placeholder="Contoh: SB-Mid-server-xxxxxxxxxxxx"
+                      className="w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3.5 py-2.5 font-mono text-xs text-[#F0E6D8] outline-none transition focus:border-[#C99A3D]"
+                    />
+                    <p className="mt-1 text-[11px] text-[#8A7A68]">
+                      Salin dari Dashboard Midtrans &gt; <strong>Settings &gt; Access Keys &gt; Server Key</strong>
+                    </p>
+                  </div>
+
+                  {configErr && (
+                    <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-400">
+                      {configErr}
+                    </div>
+                  )}
+                  {configMsg && (
+                    <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-3 text-xs text-green-400">
+                      {configMsg}
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={savingKey || !serverKeyInput.trim()}
+                    className="w-full rounded-full bg-[#C99A3D] py-2.5 text-xs font-semibold text-[#1C1410] transition hover:bg-[#DBAE55] disabled:opacity-50"
+                  >
+                    {savingKey ? 'Memverifikasi ke Midtrans...' : 'Simpan & Uji Server Key'}
+                  </button>
+                </form>
+
+                {/* Webhook Configuration Guide */}
+                <div className="border-t border-[#3A2A1E] pt-4">
+                  <p className="font-medium text-[#F0E6D8]">Payment Notification URL (Webhook Midtrans)</p>
+                  <p className="mt-0.5 text-[11px] text-[#8A7A68]">
+                    Daftarkan URL ini di Midtrans Dashboard &gt; <strong>Settings &gt; Configuration &gt; Payment Notification URL</strong>:
+                  </p>
+                  <div className="mt-2 flex items-center justify-between gap-2 rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3 py-2">
+                    <span className="font-mono text-[11px] text-[#F0E6D8] truncate">{webhookUrl}</span>
+                    <button
+                      type="button"
+                      onClick={handleCopyWebhook}
+                      className="shrink-0 flex items-center gap-1 rounded border border-[#3A2A1E] bg-[#221812] px-2.5 py-1 text-[10px] text-[#C99A3D] hover:border-[#C99A3D]"
+                    >
+                      {copiedWebhook ? <Check size={11} /> : <Copy size={11} />}
+                      {copiedWebhook ? 'Tersalin' : 'Salin'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
