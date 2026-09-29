@@ -134,8 +134,15 @@ const initUsersTable = async (db: any) => {
         'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
       ).bind('usr_demo_cust', 'Reynaldo Pelanggan', 'pelanggan@gmail.com', 'pelanggan123', 'customer', '089876543210').run();
     }
+
+    // Auto-migration kolom midtrans_order_id jika belum ada
+    try {
+      await db.exec('ALTER TABLE orders ADD COLUMN midtrans_order_id TEXT;');
+    } catch {
+      // Kolom sudah ada atau tabel belum dibuat
+    }
   } catch (err) {
-    console.error('Inisialisasi tabel users:', err);
+    console.error('Inisialisasi tabel users/orders:', err);
   }
 };
 
@@ -390,9 +397,13 @@ app.post('/midtrans/charge', async (c) => {
 
     // Helper untuk membuat mock QRIS / VA bila Server Key belum diset atau Midtrans Sandbox bermasalah
     const generateFallback = async (reason: string) => {
-      await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
-        .bind(midtransOrderId, order_id)
-        .run();
+      try {
+        await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
+          .bind(midtransOrderId, order_id)
+          .run();
+      } catch {
+        // Abaikan jika kolom midtrans_order_id belum aktif
+      }
 
       const demoQrData = `00020101021226540014ID.LINKAJA.WWW01189360091100220942040215KB${order.order_number}520458125303360540${order.total_amount}5802ID5906Kbeans6006Manado62070703A016304`;
       const demoQrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=${encodeURIComponent(demoQrData)}`;
@@ -482,9 +493,13 @@ app.post('/midtrans/charge', async (c) => {
     }
 
     // Simpan referensi transaksi Midtrans supaya webhook bisa mencocokkan status order
-    await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
-      .bind(midtransOrderId, order_id)
-      .run();
+    try {
+      await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
+        .bind(midtransOrderId, order_id)
+        .run();
+    } catch {
+      // Abaikan jika kolom midtrans_order_id belum aktif
+    }
 
     if (payment_method === 'bca_va') {
       const vaNumber = midtransData.va_numbers?.[0]?.va_number;

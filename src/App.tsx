@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield } from 'lucide-react';
+import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield, Download, Check, Copy } from 'lucide-react';
 
 // ----------------------------------------------------------------
 // Types
@@ -108,6 +108,80 @@ export default function App() {
   const [chargeError, setChargeError] = useState('');
   const [isDemoPayment, setIsDemoPayment] = useState(false);
   const [demoReason, setDemoReason] = useState('');
+  const [downloadingQr, setDownloadingQr] = useState(false);
+  const [qrDownloaded, setQrDownloaded] = useState(false);
+  const [copiedVa, setCopiedVa] = useState(false);
+
+  const downloadQrCode = async () => {
+    if (!qrUrl || !order) return;
+    setDownloadingQr(true);
+    const fileName = `QRIS-Kbeans-${order.order_number}.png`;
+
+    try {
+      // 1. Ambil file gambar langsung via Blob (CORS)
+      const res = await fetch(qrUrl, { mode: 'cors' });
+      if (res.ok) {
+        const blob = await res.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(blobUrl);
+        setDownloadingQr(false);
+        setQrDownloaded(true);
+        setTimeout(() => setQrDownloaded(false), 3000);
+        return;
+      }
+    } catch {
+      // jika fetch CORS dibatasi oleh browser, gunakan Canvas
+    }
+
+    // 2. Fallback Canvas (menggambar ulang gambar QR ke canvas lalu export ke PNG)
+    try {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || 300;
+        canvas.height = img.naturalHeight || 300;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0);
+          const dataUrl = canvas.toDataURL('image/png');
+          const a = document.createElement('a');
+          a.href = dataUrl;
+          a.download = fileName;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setQrDownloaded(true);
+          setTimeout(() => setQrDownloaded(false), 3000);
+        }
+        setDownloadingQr(false);
+      };
+      img.onerror = () => {
+        // 3. Fallback jika semua metode gagal: buka gambar di tab baru agar bisa disimpan manual
+        window.open(qrUrl, '_blank');
+        setDownloadingQr(false);
+      };
+      img.src = qrUrl;
+    } catch {
+      window.open(qrUrl, '_blank');
+      setDownloadingQr(false);
+    }
+  };
+
+  const handleCopyVa = () => {
+    if (!vaNumber) return;
+    navigator.clipboard.writeText(vaNumber);
+    setCopiedVa(true);
+    setTimeout(() => setCopiedVa(false), 2000);
+  };
 
   const handleLogout = () => {
     localStorage.removeItem('kbeans_user');
@@ -441,7 +515,22 @@ export default function App() {
               {/* STEP 1: Cart */}
               {checkoutStep === 'cart' &&
                 (cart.length === 0 ? (
-                  <p className="mt-8 text-center text-sm text-[#B8A896]">Keranjang masih kosong. Ayo pilih kopi favoritmu.</p>
+                  <div className="mt-12 flex flex-col items-center text-center">
+                    <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-[#3A2A1E]/50">
+                      <ShoppingBag size={22} className="text-[#B8A896]" />
+                    </div>
+                    <p className="text-sm font-medium text-[#F0E6D8]">Keranjang masih kosong</p>
+                    <p className="mt-1 text-xs text-[#B8A896]">Pilih kopi favoritmu dari daftar produk di toko.</p>
+                    {products.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => addToCart(products[0])}
+                        className="mt-4 rounded-full border border-[#C99A3D] bg-[#C99A3D]/10 px-4 py-2 text-xs font-medium text-[#C99A3D] transition hover:bg-[#C99A3D] hover:text-[#1C1410]"
+                      >
+                        + Tambah {products[0].name} (Coba Transaksi)
+                      </button>
+                    )}
+                  </div>
                 ) : (
                   <ul className="space-y-4">
                     {cart.map((item) => (
@@ -575,39 +664,74 @@ export default function App() {
                   )}
 
                   {paymentMethod === 'qris' && (
-                    <>
+                    <div className="flex flex-col items-center">
                       {qrUrl ? (
-                        <div className="rounded-xl bg-white p-3 shadow-md">
-                          <img
-                            src={qrUrl}
-                            alt="QRIS Pembayaran"
-                            width={220}
-                            height={220}
-                            className="rounded"
-                            onError={(e) => {
-                              const target = e.target as HTMLImageElement;
-                              if (!target.src.includes('api.qrserver.com')) {
-                                target.src = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=KB-${order.order_number}`;
-                              }
-                            }}
-                          />
-                        </div>
+                        <>
+                          <div className="rounded-2xl bg-white p-3.5 shadow-lg">
+                            <img
+                              src={qrUrl}
+                              alt="QRIS Pembayaran"
+                              width={220}
+                              height={220}
+                              className="rounded-lg"
+                              crossOrigin="anonymous"
+                              onError={(e) => {
+                                const target = e.target as HTMLImageElement;
+                                if (!target.src.includes('api.qrserver.com')) {
+                                  target.src = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=KB-${order.order_number}`;
+                                }
+                              }}
+                            />
+                          </div>
+
+                          {/* Tombol Unduh / Download QR */}
+                          <div className="mt-4 flex flex-col items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={downloadQrCode}
+                              disabled={downloadingQr}
+                              className="flex items-center gap-2 rounded-full border border-[#C99A3D] bg-[#C99A3D]/15 px-5 py-2.5 text-xs font-semibold text-[#C99A3D] shadow transition hover:bg-[#C99A3D] hover:text-[#1C1410] disabled:opacity-50"
+                            >
+                              {qrDownloaded ? (
+                                <>
+                                  <Check size={15} className="text-emerald-400" />
+                                  <span className="text-emerald-400">QRIS Berhasil Diunduh!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Download size={15} />
+                                  <span>{downloadingQr ? 'Mengunduh...' : 'Unduh QRIS (Simpan ke Galeri)'}</span>
+                                </>
+                              )}
+                            </button>
+                            <p className="max-w-[270px] text-center text-[11px] text-[#B8A896]">
+                              Simpan ke galeri untuk bayar via fitur scan foto di BCA mobile, GoPay, OVO, ShopeePay, atau DANA.
+                            </p>
+                          </div>
+                        </>
                       ) : (
                         <div className="flex h-56 w-56 flex-col items-center justify-center rounded-xl border border-dashed border-[#3A2A1E] bg-[#1C1410]">
                           <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-[#C99A3D] border-t-transparent" />
                           <p className="text-xs text-[#B8A896]">Menyiapkan kode QRIS...</p>
                         </div>
                       )}
-                      <p className="mt-4 text-xs text-[#B8A896]">Scan QR ini pakai aplikasi e-wallet / mobile banking apa pun</p>
-                    </>
+                    </div>
                   )}
 
                   {paymentMethod === 'bca_va' && (
-                    <>
+                    <div className="w-full">
                       {vaNumber ? (
-                        <div className="w-full rounded-xl border border-[#3A2A1E] bg-[#1C1410] p-5">
+                        <div className="w-full rounded-xl border border-[#3A2A1E] bg-[#1C1410] p-5 text-center">
                           <p className="text-xs text-[#B8A896]">Nomor Virtual Account BCA</p>
-                          <p className="mt-1 font-mono text-xl tracking-wider text-[#F0E6D8]">{vaNumber}</p>
+                          <p className="mt-1 font-mono text-xl font-bold tracking-wider text-[#F0E6D8]">{vaNumber}</p>
+                          <button
+                            type="button"
+                            onClick={handleCopyVa}
+                            className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-[#C99A3D] bg-[#C99A3D]/10 px-4 py-1.5 text-xs font-medium text-[#C99A3D] transition hover:bg-[#C99A3D] hover:text-[#1C1410]"
+                          >
+                            {copiedVa ? <Check size={13} /> : <Copy size={13} />}
+                            {copiedVa ? 'Nomor VA Tersalin!' : 'Salin Nomor VA'}
+                          </button>
                         </div>
                       ) : (
                         <div className="flex w-full flex-col items-center justify-center rounded-xl border border-dashed border-[#3A2A1E] bg-[#1C1410] p-5">
@@ -615,7 +739,7 @@ export default function App() {
                           <p className="text-xs text-[#B8A896]">Menyiapkan nomor Virtual Account...</p>
                         </div>
                       )}
-                    </>
+                    </div>
                   )}
 
                   {paymentMethod === 'credit_card' && (
@@ -642,15 +766,39 @@ export default function App() {
 
               {/* STEP 4: Success */}
               {checkoutStep === 'success' && order && (
-                <div className="flex flex-col items-center pt-8 text-center">
+                <div className="flex flex-col items-center pt-6 text-center">
                   <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-[#C99A3D]/15">
-                    <Coffee size={26} color="#C99A3D" />
+                    <Coffee size={28} color="#C99A3D" />
                   </div>
                   <h3 className="font-serif text-xl text-[#F0E6D8]">Pembayaran Berhasil!</h3>
-                  <p className="mt-2 text-sm text-[#B8A896]">
-                    Pesanan <span className="text-[#F0E6D8]">{order.order_number}</span> sedang kami siapkan.
+                  <p className="mt-1.5 text-xs text-[#B8A896]">
+                    Pesanan <span className="font-mono font-semibold text-[#F0E6D8]">{order.order_number}</span> sudah kami terima.
                   </p>
-                  <p className="mt-1 text-sm text-[#B8A896]">Terima kasih sudah belanja di Kbeans ☕</p>
+
+                  <div className="mt-5 w-full rounded-xl border border-[#3A2A1E] bg-[#1C1410] p-4 text-left text-xs text-[#B8A896]">
+                    <div className="flex justify-between py-1 border-b border-[#3A2A1E]/50">
+                      <span>No. Pesanan</span>
+                      <span className="font-mono text-[#F0E6D8]">{order.order_number}</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-[#3A2A1E]/50">
+                      <span>Metode Pembayaran</span>
+                      <span className="capitalize text-[#F0E6D8]">
+                        {paymentMethod === 'qris' ? 'QRIS' : paymentMethod === 'bca_va' ? 'Virtual Account BCA' : 'Kartu'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-[#3A2A1E]/50">
+                      <span>Status Pembayaran</span>
+                      <span className="font-semibold text-emerald-400">Lunas (Settlement)</span>
+                    </div>
+                    <div className="flex justify-between py-1.5 pt-2">
+                      <span>Total Transaksi</span>
+                      <span className="font-semibold text-[#F0E6D8]">{formatRupiah(order.total_amount)}</span>
+                    </div>
+                  </div>
+
+                  <p className="mt-4 text-xs text-[#8A7A68]">
+                    Terima kasih telah berbelanja di Kbeans. Tim roaster kami segera menyiapkan biji kopi segar pesanan Anda! ☕
+                  </p>
                 </div>
               )}
             </div>
@@ -722,13 +870,21 @@ export default function App() {
             )}
 
             {checkoutStep === 'success' && (
-              <div className="border-t border-[#3A2A1E] px-6 py-5">
+              <div className="space-y-2.5 border-t border-[#3A2A1E] px-6 py-5">
                 <button
                   onClick={resetCheckout}
-                  className="w-full rounded-full border border-[#C99A3D] py-3 text-sm font-medium text-[#C99A3D] transition hover:bg-[#C99A3D] hover:text-[#1C1410]"
+                  className="w-full rounded-full bg-[#C99A3D] py-3 text-sm font-semibold text-[#1C1410] transition hover:bg-[#DBAE55]"
                 >
                   Belanja Lagi
                 </button>
+                {currentUser?.role === 'admin' && (
+                  <a
+                    href="/admin"
+                    className="block w-full rounded-full border border-[#3A2A1E] py-2.5 text-center text-xs font-medium text-[#C99A3D] transition hover:border-[#C99A3D]"
+                  >
+                    Buka Dashboard Admin
+                  </a>
+                )}
               </div>
             )}
           </div>
