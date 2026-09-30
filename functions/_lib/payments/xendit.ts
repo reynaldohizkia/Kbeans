@@ -123,24 +123,29 @@ export const xenditProvider: PaymentProvider = {
       };
     }
 
-    // Endpoint yang murah dan hanya butuh scope read: mengambil balance.
+    // Validasi kredensial memakai endpoint payment request, bukan /balance.
+    // Endpoint /balance butuh permission Balance, sedangkan Panel Admin hanya
+    // meminta scope "Money In". Kalau /balance yang dipakai, key yang
+    // sepenuhnya valid akan tetap ditolak karena scope-nya tidak diberikan.
+    //
+    // id di bawah berbentuk valid tapi tidak ada:
+    //   401/403 -> key ditolak
+    //   404     -> key diterima, id memang tidak ditemukan
     try {
-      const res = await fetch(`${BASE_URL}/balance`, { headers: headers(key) });
+      const probeId = 'pr-00000000-0000-0000-0000-000000000000';
+      const res = await fetch(`${BASE_URL}/v3/payment_requests/${probeId}`, { headers: headers(key) });
       if (res.status === 401 || res.status === 403) {
         return {
           ok: false,
           detail: `HTTP ${res.status}`,
-          notes: ['Xendit menolak Secret Key ini. Pastikan Anda menyalin Secret API Key (prefix xnd_development_ / xnd_production_), bukan Public Key.'],
+          notes: [
+            res.status === 403
+              ? 'Xendit menolak akses ke Payment Requests. Pastikan Secret Key punya permission Money In: Read and write.'
+              : 'Xendit menolak Secret Key ini. Pastikan Anda menyalin Secret API Key (prefix xnd_development_ / xnd_production_), bukan Public Key.',
+          ],
         };
       }
-      if (!res.ok) {
-        return {
-          ok: true,
-          detail: `HTTP ${res.status}`,
-          mode: detected,
-          notes: ['Key diterima, tapi endpoint balance tidak merespons normal. Coba lagi saat menjawabannya akan dipakai.'],
-        };
-      }
+      // 404 justru tanda kredensial benar, karena id probe memang tidak ada.
     } catch (err: any) {
       return {
         ok: false,
@@ -155,7 +160,10 @@ export const xenditProvider: PaymentProvider = {
       mode: detected,
       notes:
         detected === 'test'
-          ? ['Mode TEST: seluruh channel aktif dan pembayaran bisa disimulasikan tanpa uang asli.']
+          ? [
+              'Mode TEST: seluruh channel aktif dan pembayaran bisa disimulasikan tanpa uang asli.',
+              'Webhook opsional — status tetap dipantau langsung ke Xendit.',
+            ]
           : ['Mode LIVE: pembayaran memakai uang sungguhan. Pastikan testing sudah selesai sebelum menyimpan key ini.'],
     };
   },
