@@ -275,10 +275,17 @@ const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
   const storedMode = ((await getSetting(env, 'MIDTRANS_MODE')) || env.MIDTRANS_MODE || '')
     .trim()
     .toLowerCase();
+  const storedIsValidMode = storedMode === 'sandbox' || storedMode === 'production';
   const fallbackMode: MidtransMode = storedMode === 'sandbox' ? 'sandbox' : 'production';
 
+  //Begitu sebuah key sudah pernah diverifikasi ke Midtrans, environment hasil
+  //verifikasi itu yang dipakai. Tebakan dari prefix key hanya dipakai sebelum
+  //pernah diverifikasi, karena key sandbox versi lama punya prefix yang sama
+  //persis dengan key production.
+  const modeVerified = (await getSetting(env, 'MIDTRANS_MODE_VERIFIED')) === '1';
+
   const detected = detectModeFromServerKey(serverKey);
-  const mode = detected || fallbackMode;
+  const mode = modeVerified && storedIsValidMode ? storedMode as MidtransMode : detected || fallbackMode;
 
   const storedAcquirer = ((await getSetting(env, 'MIDTRANS_QRIS_ACQUIRER')) || env.MIDTRANS_QRIS_ACQUIRER || '')
     .trim()
@@ -293,7 +300,11 @@ const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
     baseUrl: MIDTRANS_BASE_URL[mode],
     acquirer,
     keySource: dbKey ? 'Database Settings' : envKey ? 'Cloudflare Environment' : 'Belum Diatur',
-    modeSource: detected ? 'deteksi otomatis dari Server Key' : 'pengaturan manual',
+    modeSource: modeVerified
+      ? 'terverifikasi ke Midtrans'
+      : detected
+        ? 'deteksi otomatis dari Server Key'
+        : 'pengaturan manual',
   };
 };
 
@@ -539,67 +550,91 @@ app.post('/admin/midtrans/config', async (c) => {
     return c.json({ success: false, message: 'Server Key tidak boleh kosong' }, 400);
   }
 
-  // Key dari Cloudflare Environment selalu menang atas key di database, jadi
-  // simpan key baru hanya kalau diketik di form DAN key env var tidak ada.
-  const envManaged = !!(c.env.MIDTRANS_SERVER_KEY || '').trim();
   const cleanKey = typedKey || current.serverKey;
   const detectedMode = detectModeFromServerKey(cleanKey);
   const requestedMode: MidtransMode = String(mode).toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
-  const effectiveMode: MidtransMode = detectedMode || requestedMode;
-  const baseUrl = MIDTRANS_BASE_URL[effectiveMode];
 
   const requestedAcquirer = String(qris_acquirer || '').trim().toLowerCase();
   const acquirer = (MIDTRANS_QRIS_ACQUIRERS as readonly string[]).includes(requestedAcquirer)
     ? requestedAcquirer
     : MIDTRANS_QRIS_ACQUIRERS[0];
 
-  // Uji kredensial terhadap environment yang BENAR (bukan selalu sandbox)
+  // Prefix Server Key tidak selalu bisa dipercaya: key sandbox versi lama
+  // berformat 'Mid-server-...' sama persis dengan key production. Jadi kedua
+  // environment dicoba, dan yang dipakai adalah yang benar-benar mengizinkan
+  // key ini -- bukan yang mana pun hasil tebakan prefix.
+  const tryModes: MidtransMode[] = (() => {
+    const first = detectedMode || requestedMode;
+    const second: MidtransMode = first === 'production' ? 'sandbox' : 'production';
+    return [first, second];
+  })();
+
+  let effectiveMode: MidtransMode | null = null;
+  let verified = false;
+  const rejections: string[] = [];
+
   try {
-    const check = await verifyServerKey(baseUrl, cleanKey);
-    if (!check.valid) {
-      // Coba environment satu lagi supaya pesan errornya bisa menunjuk key yang
-      // tepat, bukan sekadar "401" yang membingungkan.
-      const otherMode: MidtransMode = effectiveMode === 'production' ? 'sandbox' : 'production';
-      const otherCheck = await verifyServerKey(MIDTRANS_BASE_URL[otherMode], cleanKey).catch(() => null);
-
-      const hint = otherCheck?.valid
-        ? `Key ini justru DITERIMA di environment ${otherMode.toUpperCase()}. `
-          + `Jadi ini ${otherMode === 'sandbox' ? 'Sandbox' : 'Production'} Server Key, `
-          + `bukan ${effectiveMode === 'sandbox' ? 'Sandbox' : 'Production'} Server Key.`
-        : effectiveMode === 'production'
-          ? 'Pastikan Anda menyalin Production Server Key (SK-Mid-server-...) dari Dashboard > Settings > Access Keys.'
-          : 'Pastikan Anda menyalin Sandbox Server Key (SB-Mid-server-...) dari Sandbox Dashboard > Settings > Access Keys.';
-
-      return c.json({
-        success: false,
-        message: `Midtrans menolak Server Key ini di environment ${effectiveMode} (${check.detail}). ${hint}`,
-        tested_mode: effectiveMode,
-        other_mode_accepted: !!otherCheck?.valid,
-      }, 400);
+    for (const mode of tryModes) {
+      const check = await verifyServerKey(MIDTRANS_BASE_URL[mode], cleanKey);
+      if (check.valid) {
+        effectiveMode = mode;
+        verified = true;
+        break;
+      }
+      rejections.push(`${mode} (${check.detail})`);
     }
   } catch {
-    // Jaringan ke Midtrans tidak bisa dicek saat ini: simpan saja, charge
-    // berikutnya akan memberi tahu jika kredensialnya benar-benar salah.
+    // Jaringan ke Midtrans tidak bisa dicek saat ini. Simpan saja; charge
+    // berikutnya akan memberi tahu kalau kredensialnya benar-benar salah.
   }
+
+  if (!effectiveMode) {
+    const networkIssue = rejections.length === 0;
+    return c.json({
+      success: false,
+      message: networkIssue
+        ? 'Tidak bisa menghubungi server Midtrans untuk memverifikasi Server Key. Coba lagi beberapa saat lagi.'
+        : `Midtrans menolak Server Key ini di kedua environment (${rejections.join(', ')}). `
+          + 'Salin ulang dari Midtrans Dashboard > Settings > Access Keys, lalu paste di sini.',
+      rejected_in: rejections,
+    }, 400);
+  }
+
+  const prefixGuessedWrong = detectedMode !== null && detectedMode !== effectiveMode;
 
   if (typedKey) {
     await setSetting(c.env, 'MIDTRANS_SERVER_KEY', typedKey);
   }
   await setSetting(c.env, 'MIDTRANS_MODE', effectiveMode);
   await setSetting(c.env, 'MIDTRANS_QRIS_ACQUIRER', acquirer);
+  if (verified) {
+    await setSetting(c.env, 'MIDTRANS_MODE_VERIFIED', '1');
+  }
 
   current = await getMidtransConfig(c.env);
 
+  const notes: string[] = [];
+  if (prefixGuessedWrong) {
+    notes.push(
+      `Awalan key terlihat seperti ${detectedMode}, tapi Midtrans hanya menerimanya di ${effectiveMode.toUpperCase()}. `
+      + 'Mode sudah disesuaikan otomatis.'
+    );
+  }
+  if (effectiveMode === 'sandbox') {
+    notes.push('Mode SANDBOX: QRIS hanya bisa diuji lewat simulator Midtrans, tidak bisa dibayar dengan GoPay/OVO sungguhan.');
+  }
+
   return c.json({
     success: true,
-    message: `Pengaturan tersimpan. QRIS & Virtual Account aktif di environment ${current.mode.toUpperCase()} (${current.baseUrl}), acquirer: ${current.acquirer}.`,
+    message: `Server Key terverifikasi di ${effectiveMode.toUpperCase()}. ${notes.join(' ')}`.trim(),
     masked_key: maskSecret(current.serverKey),
     mode: current.mode,
-    mode_source: current.modeSource,
+    mode_source: verified ? 'terverifikasi ke Midtrans' : current.modeSource,
     base_url: current.baseUrl,
     acquirer: current.acquirer,
     key_source: current.keySource,
-    env_managed: envManaged,
+    verified,
+    notes,
   });
 });
 
