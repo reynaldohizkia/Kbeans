@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield, Download, Check, Copy, Info } from 'lucide-react';
 import QrCanvas from './QrCanvas';
 
@@ -119,8 +119,7 @@ export default function App() {
 
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
   // Pesan error mentah dari server, dipakai kalau parsing JSON gagal.
-  // Cukup variabel lokal: hanya dibaca di dalam satu pemanggilan placeOrder.
-  let lastRequestError = '';
+  const lastRequestError = useRef('');
 
   // Dua sumber QR, tergantung gateway:
   //   qrString -> dirender sendiri di browser (Xendit)
@@ -253,7 +252,7 @@ export default function App() {
     setQrUrl('');
     setVaNumber('');
     setVaBank('');
-    lastRequestError = '';
+    lastRequestError.current = '';
     try {
       const res = await fetch('/api/orders', {
         method: 'POST',
@@ -298,9 +297,10 @@ export default function App() {
       }
 
       if (!chargeData) {
-        lastRequestError = `Server membalas HTTP ${chargeRes.status} dengan respons yang tidak bisa dibaca. `
+        lastRequestError.current =
+          `Server membalas HTTP ${chargeRes.status} dengan respons yang tidak bisa dibaca. `
           + (rawBody ? `Isi: ${rawBody.slice(0, 200)}` : 'Respons kosong.');
-        throw new Error(lastRequestError);
+        throw new Error(lastRequestError.current);
       }
 
       // Gateway menolak? Tampilkan error aslinya. Jangan pernah menampilkan QR
@@ -333,7 +333,7 @@ export default function App() {
       // dan penyebab aslinya ikut hilang. Ambil isi respons apa adanya.
       console.error(e);
       setCheckoutStep('payment');
-      setChargeError(lastRequestError || 'Tidak bisa menghubungi server. Periksa koneksi internet Anda.');
+      setChargeError(lastRequestError.current || 'Tidak bisa menghubungi server. Periksa koneksi internet Anda.');
     } finally {
       setPlacingOrder(false);
     }
