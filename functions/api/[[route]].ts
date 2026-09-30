@@ -240,6 +240,18 @@ export interface MidtransConfig {
   modeSource: string;
 }
 
+// Sidik jari Server Key, dipakai untuk mengikat mode yang sudah diverifikasi
+// ke key spesifik itu. Tanpa ini, mode lama ikut terpakai setelah key diganti
+// sehingga transaksi diarahkan ke environment yang salah.
+const serverKeyFingerprint = async (serverKey: string): Promise<string> => {
+  if (!serverKey) return '';
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serverKey));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+};
+
 // Mengambil seluruh konfigurasi Midtrans: Server Key, environment (production /
 // sandbox), base URL, dan acquirer QRIS. Environment ditentukan dari prefix
 // Server Key, sehingga Key produksi otomatis memakai api.midtrans.com.
@@ -259,14 +271,16 @@ const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
   const storedIsValidMode = storedMode === 'sandbox' || storedMode === 'production';
   const fallbackMode: MidtransMode = storedMode === 'sandbox' ? 'sandbox' : 'production';
 
-  //Begitu sebuah key sudah pernah diverifikasi ke Midtrans, environment hasil
-  //verifikasi itu yang dipakai. Tebakan dari prefix key hanya dipakai sebelum
-  //pernah diverifikasi, karena key sandbox versi lama punya prefix yang sama
-  //persis dengan key production.
-  const modeVerified = (await getSetting(env, 'MIDTRANS_MODE_VERIFIED')) === '1';
+  // Mode hasil verifikasi hanya dipercaya bila menyangkut key yang sama
+  // persis. Begitu key diganti, app kembali menebak dari prefix sampai key
+  // baru diverifikasi ulang lewat Panel Admin.
+  const verifiedFingerprint = await getSetting(env, 'MIDTRANS_VERIFIED_KEY');
+  const modeVerified = !!verifiedFingerprint
+    && verifiedFingerprint === await serverKeyFingerprint(serverKey);
 
   const detected = detectModeFromServerKey(serverKey);
   const mode = modeVerified && storedIsValidMode ? storedMode as MidtransMode : detected || fallbackMode;
+
 
   const storedAcquirer = ((await getSetting(env, 'MIDTRANS_QRIS_ACQUIRER')) || env.MIDTRANS_QRIS_ACQUIRER || '')
     .trim()
@@ -588,9 +602,13 @@ app.post('/admin/midtrans/config', async (c) => {
   }
   await setSetting(c.env, 'MIDTRANS_MODE', effectiveMode);
   await setSetting(c.env, 'MIDTRANS_QRIS_ACQUIRER', acquirer);
-  if (verified) {
-    await setSetting(c.env, 'MIDTRANS_MODE_VERIFIED', '1');
-  }
+
+  // Ikat mode ke key ini, supaya mengganti key otomatis membatalkan mode lama.
+  await setSetting(
+    c.env,
+    'MIDTRANS_VERIFIED_KEY',
+    verified ? await serverKeyFingerprint(cleanKey) : ''
+  );
 
   current = await getMidtransConfig(c.env);
 
