@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+﻿import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { handle } from 'hono/cloudflare-pages';
 
@@ -131,100 +131,82 @@ const verifyAdminAccess = (key: string | undefined, envAdminKey: string | undefi
   return false;
 };
 
-// Inisialisasi tabel users di D1 secara otomatis jika belum ada
-const initUsersTable = async (db: any) => {
+// Nama tabel yang wajib ada sebelum route auth / admin bisa bekerja. Tabelnya
+// dibuat lewat migration (migration_auth_settings.sql), bukan dari dalam
+// request: DDL runtime sempat gagal diam-diam sehingga database produksi tetap
+// tanpa tabel users & settings, dan gejalanya baru muncul jauh kemudian
+// (login diam-diam jatuh ke kredensial hardcoded, Panel Admin 500).
+const REQUIRED_TABLES = ['users', 'settings'] as const;
+
+export class SchemaError extends Error {
+  constructor(public readonly missing: string[]) {
+    super(
+      `Tabel database belum lengkap (${missing.join(', ')}). `
+      + 'Jalankan: npx wrangler d1 execute kbeans-db --remote --file=migration_auth_settings.sql'
+    );
+    this.name = 'SchemaError';
+  }
+}
+
+// Memastikan skema sudah dimigrasi, tanpa mencoba membuatnya sendiri.
+const assertSchemaReady = async (db: any) => {
+  if (!db) throw new SchemaError([...REQUIRED_TABLES]);
+
+  const placeholders = REQUIRED_TABLES.map(() => '?').join(',');
+  const { results } = await db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+    .bind(...REQUIRED_TABLES)
+    .all();
+
+  const existing = new Set((results || []).map((r: any) => r.name));
+  const missing = REQUIRED_TABLES.filter((t) => !existing.has(t));
+  if (missing.length) throw new SchemaError(missing);
+};
+
+// Memastikan akun demo tersedia. Idempotent, jadi aman dipanggil tiap request.
+const seedDefaultUsers = async (db: any) => {
   if (!db) return;
+  const defaults = [
+    ['usr_admin', 'Administrator Kbeans', 'admin@kbeans.com', 'admin123', 'admin', '081234567890'],
+    ['usr_demo_cust', 'Reynaldo Pelanggan', 'pelanggan@gmail.com', 'pelanggan123', 'customer', '089876543210'],
+  ];
+
+  for (const [id, name, email, password, role, phone] of defaults) {
+    const exists = await db.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+    if (exists) continue;
+    await db
+      .prepare('INSERT OR IGNORE INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(id, name, email, password, role, phone)
+      .run();
+  }
+};
+
+// Satu-satunya Eintritt point untuk route yang butuh tabel auth/settings.
+const initAuthSchema = async (db: any) => {
+  await assertSchemaReady(db);
+  await seedDefaultUsers(db);
+};
+
+// Menjamin kolom Midtrans di tabel orders tersedia. Kolomnya dibuat lewat
+// migration; di sini hanya dibaca, dan bila kosong seluruh fitur QRIS/VA
+// otomatis dinonaktifkan dengan pesan yang jelas.
+const hasOrderMidtransColumns = async (db: any) => {
+  if (!db) return false;
   try {
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'customer',
-        phone TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Pastikan akun admin bawaan tersedia
-    const adminExists = await db.prepare('SELECT id FROM users WHERE email = ?').bind('admin@kbeans.com').first();
-    if (!adminExists) {
-      await db.prepare(
-        'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind('usr_admin', 'Administrator Kbeans', 'admin@kbeans.com', 'admin123', 'admin', '081234567890').run();
-    }
-
-    // Pastikan akun pelanggan demo tersedia
-    const customerExists = await db.prepare('SELECT id FROM users WHERE email = ?').bind('pelanggan@gmail.com').first();
-    if (!customerExists) {
-      await db.prepare(
-        'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind('usr_demo_cust', 'Reynaldo Pelanggan', 'pelanggan@gmail.com', 'pelanggan123', 'customer', '089876543210').run();
-    }
-
-    // Auto-migration tabel settings untuk konfigurasi Midtrans
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Auto-migration kolom midtrans_order_id jika belum ada
-    try {
-      await db.exec('ALTER TABLE orders ADD COLUMN midtrans_order_id TEXT;');
-    } catch {
-      // Kolom sudah ada atau tabel belum dibuat
-    }
-
-    // URL gambar QRIS asli dari Midtrans, disimpan supaya proxy /api/midtrans/qr
-    // tidak selalu bergantung pada panggilan status ke Midtrans.
-    try {
-      await db.exec('ALTER TABLE orders ADD COLUMN midtrans_qr_url TEXT;');
-    } catch {
-      // Kolom sudah ada atau tabel belum dibuat
-    }
-  } catch (err) {
-    console.error('Inisialisasi tabel users/orders/settings:', err);
+    const { results } = await db.prepare('PRAGMA table_info(orders)').all();
+    const names = new Set((results || []).map((r: any) => r.name));
+    return names.has('midtrans_order_id') && names.has('midtrans_qr_url');
+  } catch {
+    return false;
   }
 };
 
-// Menjamin kolom Midtrans di tabel orders tersedia (dipanggil dari route
-// pembayaran, supaya tidak bergantung pada route login yang pernah diakses)
-const ensureOrderMidtransColumns = async (db: any) => {
-  if (!db) return;
-  for (const column of ['midtrans_order_id', 'midtrans_qr_url']) {
-    try {
-      await db.exec(`ALTER TABLE orders ADD COLUMN ${column} TEXT;`);
-    } catch {
-      // Kolom sudah ada atau tabel belum dibuat
-    }
-  }
-};
-
-// Inisialisasi tabel settings (berisi konfigurasi Midtrans) bila belum ada
-const ensureSettingsTable = async (db: any) => {
-  if (!db) return;
-  try {
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-  } catch (err) {
-    console.error('Inisialisasi tabel settings:', err);
-  }
-};
-
-// Membaca satu nilai dari tabel settings (tanpa melempar error bila belum ada)
+// Membaca satu nilai dari tabel settings. Tabel dibuat lewat migration
+// (migration_auth_settings.sql); kalau belum ada, nilainya dianggap kosong
+// supaya route lain tetap bisa jalan.
 const getSetting = async (env: Bindings, key: string): Promise<string> => {
   if (!env.DB) return '';
   try {
-    await ensureSettingsTable(env.DB);
     const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first();
     return row?.value ? String(row.value) : '';
   } catch {
@@ -235,7 +217,6 @@ const getSetting = async (env: Bindings, key: string): Promise<string> => {
 // Menyimpan satu nilai ke tabel settings
 const setSetting = async (env: Bindings, key: string, value: string) => {
   if (!env.DB) return;
-  await ensureSettingsTable(env.DB);
   await env.DB.prepare(`
     INSERT INTO settings (key, value, updated_at)
     VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -333,7 +314,7 @@ app.post('/auth/login', async (c) => {
 
     // 1. Cek di Database D1 jika tersedia
     if (c.env.DB) {
-      await initUsersTable(c.env.DB);
+      await initAuthSchema(c.env.DB);
       const user = await c.env.DB.prepare('SELECT id, name, email, role, phone, password FROM users WHERE LOWER(email) = ?')
         .bind(cleanEmail)
         .first();
@@ -414,7 +395,7 @@ app.post('/auth/register', async (c) => {
     const userId = `usr_${Date.now()}`;
 
     if (c.env.DB) {
-      await initUsersTable(c.env.DB);
+      await initAuthSchema(c.env.DB);
       const existing = await c.env.DB.prepare('SELECT id FROM users WHERE LOWER(email) = ?').bind(cleanEmail).first();
       if (existing) {
         return c.json({ success: false, message: 'Email ini sudah terdaftar. Silakan login.' }, 400);
@@ -732,6 +713,16 @@ app.post('/midtrans/charge', async (c) => {
       }, 400);
     }
 
+    // Tanpa kolom midtrans_* transaksi tidak bisa ditautkan ke order, jadi QR
+    // yang dibuat tidak akan pernahUpdating status pembayaran.
+    if (!(await hasOrderMidtransColumns(c.env.DB))) {
+      return c.json({
+        success: false,
+        message: 'Kolom midtrans_order_id / midtrans_qr_url belum ada di tabel orders. '
+          + 'Jalankan: npx wrangler d1 execute kbeans-db --remote --file=migration_auth_settings.sql',
+      }, 500);
+    }
+
     // Midtrans mewajibkan order_id unik yang belum pernah dipakai (maks 50 karakter).
     const midtransOrderId = `${order.order_number}-${Date.now()}`;
 
@@ -858,15 +849,11 @@ app.post('/midtrans/charge', async (c) => {
     }
 
     // Transaksi NYATA berhasil dibuat. Simpan referensi transaksinya ke D1
-    // supaya status bisa dicek ulang ke Midtrans kapan saja.
-    await ensureOrderMidtransColumns(c.env.DB);
-    try {
-      await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
-        .bind(midtransOrderId, order_id)
-        .run();
-    } catch {
-      // Abaikan jika kolom midtrans_order_id belum aktif
-    }
+    // supaya status bisa dicek ulang ke Midtrans kapan saja. Kolom midtrans_*
+    // sudah dipastikan ada di awal handler ini.
+    await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
+      .bind(midtransOrderId, order_id)
+      .run();
 
     if (payment_method === 'bca_va') {
       const vaNumber =
@@ -904,14 +891,9 @@ app.post('/midtrans/charge', async (c) => {
       }, 502);
     }
 
-    try {
-      await c.env.DB.prepare('UPDATE orders SET midtrans_qr_url = ? WHERE id = ?')
-        .bind(qrAction.url, order_id)
-        .run();
-    } catch {
-      // Abaikan jika kolom midtrans_qr_url belum aktif; proxy akan mencari
-      // sendiri lewat API status Midtrans.
-    }
+    await c.env.DB.prepare('UPDATE orders SET midtrans_qr_url = ? WHERE id = ?')
+      .bind(qrAction.url, order_id)
+      .run();
 
     return c.json({
       success: true,
@@ -940,7 +922,7 @@ app.get('/midtrans/qr', async (c) => {
     return c.json({ success: false, message: 'order_id wajib diisi' }, 400);
   }
 
-  await ensureOrderMidtransColumns(c.env.DB);
+  // Kolom midtrans_* sudah dimigrasi; dicek di ensureOrderColumns di bawah.
 
   const order: any = await c.env.DB
     .prepare('SELECT midtrans_order_id, midtrans_qr_url FROM orders WHERE id = ?')
