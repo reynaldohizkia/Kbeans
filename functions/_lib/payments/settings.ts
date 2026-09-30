@@ -37,12 +37,18 @@ export async function setActiveProviderId(env: Env, id: ProviderId): Promise<voi
   await setSetting(env, SETTING_PROVIDER, id);
 }
 
-/** SHA-256 hex, dipakai untuk mengikat mode terverifikasi ke key tertentu. */
+/**
+ * SHA-256 hex, dipotong 32 karakter (128 bit) untuk sidik jari credential.
+ * Panjang ini cukup untuk mengikat mode ke key tertentu, dan sengaja dibuat
+ * sama supaya fingerprint yang tersimpan dari versi sebelumnya tetap cocok.
+ */
+
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+    .join('')
+    .slice(0, 32);
 }
 
 /**
