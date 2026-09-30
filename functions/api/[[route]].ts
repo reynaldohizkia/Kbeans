@@ -313,6 +313,23 @@ const midtransHeaders = (serverKey: string) => ({
 });
 
 // ------------------------------------------------------------------
+// Password disimpan sebagai hash SHA-256, bukan teks biasa. Password lama yang
+// masih tersimpan polos tetap bisa login lalu otomatis di-upgrade ke hash.
+const hashPassword = async (password: string): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const looksHashed = (value: unknown): value is string =>
+  typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+
+const verifyPassword = async (stored: unknown, candidate: string) => {
+  if (looksHashed(stored)) return stored === await hashPassword(candidate);
+  return stored === candidate;
+};
+
 // POST /api/auth/login
 // Login untuk membedakan admin dan pelanggan
 // ------------------------------------------------------------------
@@ -334,7 +351,14 @@ app.post('/auth/login', async (c) => {
         .first();
 
       if (user) {
-        if (user.password === cleanPass) {
+        if (await verifyPassword(user.password, cleanPass)) {
+          // Upgrade password polos menjadi hash saat login berhasil.
+          if (!looksHashed(user.password)) {
+            await c.env.DB.prepare('UPDATE users SET password = ? WHERE id = ?')
+              .bind(await hashPassword(cleanPass), user.id)
+              .run();
+          }
+
           const token = user.role === 'admin'
             ? (c.env.ADMIN_KEY || 'kbeans_admin_token')
             : `token_${user.id}_${Date.now()}`;
@@ -351,41 +375,18 @@ app.post('/auth/login', async (c) => {
             token,
           });
         } else {
-          return c.json({ success: false, message: 'Password salah' }, 401);
+          return c.json({ success: false, message: 'Email atau password salah' }, 401);
         }
       }
     }
 
-    // 2. Fallback autentikasi bawaan (demo tanpa D1 / lokal)
-    if (cleanEmail === 'admin@kbeans.com' && cleanPass === 'admin123') {
-      return c.json({
-        success: true,
-        user: {
-          id: 'usr_admin',
-          name: 'Administrator Kbeans',
-          email: 'admin@kbeans.com',
-          role: 'admin',
-          phone: '081234567890',
-        },
-        token: c.env.ADMIN_KEY || 'kbeans_admin_token',
-      });
-    }
-
-    if (cleanEmail === 'pelanggan@gmail.com' && cleanPass === 'pelanggan123') {
-      return c.json({
-        success: true,
-        user: {
-          id: 'usr_demo_cust',
-          name: 'Reynaldo Pelanggan',
-          email: 'pelanggan@gmail.com',
-          role: 'customer',
-          phone: '089876543210',
-        },
-        token: 'token_demo_customer',
-      });
-    }
-
-    return c.json({ success: false, message: 'Akun tidak ditemukan. Silakan periksa kembali atau daftar akun baru.' }, 404);
+    // 2. Akun hanya diakui bila ada di database. Dulu ada fallback login
+    // hardcoded (admin@kbeans.com / admin123) di sini, yang membuat password
+    // yang diganti lewat Panel Admin tidak benar-benar berlaku.
+    return c.json({
+      success: false,
+      message: 'Akun tidak ditemukan. Silakan periksa kembali atau daftar akun baru.',
+    }, 404);
   } catch (err: any) {
     return c.json({ success: false, message: `Error login: ${err?.message || String(err)}` }, 500);
   }
@@ -408,6 +409,10 @@ app.post('/auth/register', async (c) => {
     const cleanPhone = phone ? String(phone).trim() : '';
     const userId = `usr_${Date.now()}`;
 
+    if (cleanPass.length < 8) {
+      return c.json({ success: false, message: 'Password minimal 8 karakter' }, 400);
+    }
+
     if (c.env.DB) {
       await initAuthSchema(c.env.DB);
       const existing = await c.env.DB.prepare('SELECT id FROM users WHERE LOWER(email) = ?').bind(cleanEmail).first();
@@ -417,7 +422,7 @@ app.post('/auth/register', async (c) => {
 
       await c.env.DB.prepare(
         'INSERT INTO users (id, name, email, password, role, phone) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(userId, cleanName, cleanEmail, cleanPass, 'customer', cleanPhone).run();
+      ).bind(userId, cleanName, cleanEmail, await hashPassword(cleanPass), 'customer', cleanPhone).run();
     }
 
     return c.json({
@@ -635,6 +640,52 @@ app.post('/admin/midtrans/config', async (c) => {
     verified,
     notes,
   });
+});
+
+// ------------------------------------------------------------------
+// POST /api/auth/change-password
+// Mengganti password sendiri. Password lama harus benar supaya nobody bisa
+// mengambil alih akun hanya dengan knowing email.
+// ------------------------------------------------------------------
+app.post('/auth/change-password', async (c) => {
+  try {
+    const { email, current_password, new_password } = await c.req.json();
+
+    if (!email || !current_password || !new_password) {
+      return c.json({ success: false, message: 'Email, password lama, dan password baru wajib diisi' }, 400);
+    }
+    if (String(new_password).length < 8) {
+      return c.json({ success: false, message: 'Password baru minimal 8 karakter' }, 400);
+    }
+    if (new_password === current_password) {
+      return c.json({ success: false, message: 'Password baru harus berbeda dari password lama' }, 400);
+    }
+    if (!c.env.DB) {
+      return c.json({ success: false, message: 'Database tidak tersedia' }, 500);
+    }
+
+    await initAuthSchema(c.env.DB);
+
+    const user: any = await c.env.DB
+      .prepare('SELECT id, password FROM users WHERE LOWER(email) = ?')
+      .bind(String(email).trim().toLowerCase())
+      .first();
+
+    if (!user) {
+      return c.json({ success: false, message: 'Akun tidak ditemukan' }, 404);
+    }
+    if (!(await verifyPassword(user.password, String(current_password)))) {
+      return c.json({ success: false, message: 'Password lama salah' }, 401);
+    }
+
+    await c.env.DB.prepare('UPDATE users SET password = ? WHERE id = ?')
+      .bind(await hashPassword(String(new_password)), user.id)
+      .run();
+
+    return c.json({ success: true, message: 'Password berhasil diganti. Silakan login ulang.' });
+  } catch (err: any) {
+    return c.json({ success: false, message: `Error ganti password: ${err?.message || String(err)}` }, 500);
+  }
 });
 
 // ------------------------------------------------------------------

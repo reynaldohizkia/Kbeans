@@ -4,12 +4,15 @@ import { Coffee, Shield, User, ArrowLeft } from 'lucide-react';
 export default function LoginPage() {
   const [roleTab, setRoleTab] = useState<'customer' | 'admin'>('customer');
   const [isRegister, setIsRegister] = useState(false);
+  const [isChangePassword, setIsChangePassword] = useState(false);
 
   // Form states
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -22,6 +25,35 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
+      if (isChangePassword) {
+        if (newPassword !== confirmPassword) {
+          setError('Konfirmasi password baru tidak sama.');
+          return;
+        }
+        if (newPassword.length < 8) {
+          setError('Password baru minimal 8 karakter.');
+          return;
+        }
+
+        const res = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, current_password: password, new_password: newPassword }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          setError(data.message || 'Gagal mengganti password.');
+          return;
+        }
+
+        setSuccessMsg('Password berhasil diganti. Silakan masuk dengan password baru.');
+        setPassword('');
+        setNewPassword('');
+        setConfirmPassword('');
+        setIsChangePassword(false);
+        return;
+      }
+
       if (roleTab === 'customer' && isRegister) {
         // Daftar pelanggan baru
         const res = await fetch('/api/auth/register', {
@@ -80,6 +112,7 @@ export default function LoginPage() {
   const fillDemoAdmin = () => {
     setRoleTab('admin');
     setIsRegister(false);
+    setIsChangePassword(false);
     setEmail('admin@kbeans.com');
     setPassword('admin123');
     setError('');
@@ -145,6 +178,7 @@ export default function LoginPage() {
                 onClick={() => {
                   setRoleTab('admin');
                   setIsRegister(false);
+                  setIsChangePassword(false);
                   setError('');
                 }}
                 className={`flex flex-1 items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition ${
@@ -157,6 +191,41 @@ export default function LoginPage() {
                 Admin
               </button>
             </div>
+
+            {/* Sub-toggle Admin (Masuk / Ganti Password) */}
+            {roleTab === 'admin' && (
+              <div className="mb-5 flex justify-center gap-4 border-b border-[#3A2A1E]/60 pb-3 text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsChangePassword(false);
+                    setError('');
+                  }}
+                  className={`pb-1 transition ${
+                    !isChangePassword
+                      ? 'border-b-2 border-[#C99A3D] font-medium text-[#F0E6D8]'
+                      : 'text-[#B8A896] hover:text-[#F0E6D8]'
+                  }`}
+                >
+                  Masuk
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsChangePassword(true);
+                    setError('');
+                    setPassword('');
+                  }}
+                  className={`pb-1 transition ${
+                    isChangePassword
+                      ? 'border-b-2 border-[#C99A3D] font-medium text-[#F0E6D8]'
+                      : 'text-[#B8A896] hover:text-[#F0E6D8]'
+                  }`}
+                >
+                  Ganti Password
+                </button>
+              </div>
+            )}
 
             {/* Sub-toggle Pelanggan (Masuk / Daftar) */}
             {roleTab === 'customer' && (
@@ -239,7 +308,9 @@ export default function LoginPage() {
               </div>
 
               <div>
-                <label className="mb-1 block text-xs text-[#B8A896]">Password</label>
+                <label className="mb-1 block text-xs text-[#B8A896]">
+                  {isChangePassword ? 'Password Lama' : 'Password'}
+                </label>
                 <input
                   type="password"
                   required
@@ -250,6 +321,35 @@ export default function LoginPage() {
                 />
               </div>
 
+              {isChangePassword && (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs text-[#B8A896]">Password Baru</label>
+                    <input
+                      type="password"
+                      required
+                      minLength={8}
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      placeholder="Minimal 8 karakter"
+                      className="w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3.5 py-2.5 text-sm text-[#F0E6D8] outline-none transition focus:border-[#C99A3D]"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-[#B8A896]">Ulangi Password Baru</label>
+                    <input
+                      type="password"
+                      required
+                      minLength={8}
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      placeholder="Ulangi password baru"
+                      className="w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3.5 py-2.5 text-sm text-[#F0E6D8] outline-none transition focus:border-[#C99A3D]"
+                    />
+                  </div>
+                </>
+              )}
+
               <button
                 type="submit"
                 disabled={loading}
@@ -257,6 +357,8 @@ export default function LoginPage() {
               >
                 {loading
                   ? 'Memproses...'
+                  : isChangePassword
+                  ? 'Simpan Password Baru'
                   : roleTab === 'admin'
                   ? 'Masuk ke Dashboard Admin'
                   : isRegister
