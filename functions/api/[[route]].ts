@@ -262,10 +262,15 @@ export interface MidtransConfig {
 // Mengambil seluruh konfigurasi Midtrans: Server Key, environment (production /
 // sandbox), base URL, dan acquirer QRIS. Environment ditentukan dari prefix
 // Server Key, sehingga Key produksi otomatis memakai api.midtrans.com.
+//
+// Key yang disimpan lewat Panel Admin (tabel settings) didahulukan atas
+// Environment Variable Cloudflare, supaya key bisa diperbarui dari browser
+// tanpa harus membuka dashboard Cloudflare. Env var tetap dipakai sebagai
+// nilai awal / cadangan.
 const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
   const envKey = (env.MIDTRANS_SERVER_KEY || '').trim();
   const dbKey = (await getSetting(env, 'MIDTRANS_SERVER_KEY')).trim();
-  const serverKey = envKey || dbKey;
+  const serverKey = dbKey || envKey;
 
   const storedMode = ((await getSetting(env, 'MIDTRANS_MODE')) || env.MIDTRANS_MODE || '')
     .trim()
@@ -287,7 +292,7 @@ const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
     mode,
     baseUrl: MIDTRANS_BASE_URL[mode],
     acquirer,
-    keySource: envKey ? 'Cloudflare Environment' : serverKey ? 'Database Settings' : 'Belum Diatur',
+    keySource: dbKey ? 'Database Settings' : envKey ? 'Cloudflare Environment' : 'Belum Diatur',
     modeSource: detected ? 'deteksi otomatis dari Server Key' : 'pengaturan manual',
   };
 };
@@ -552,12 +557,24 @@ app.post('/admin/midtrans/config', async (c) => {
   try {
     const check = await verifyServerKey(baseUrl, cleanKey);
     if (!check.valid) {
+      // Coba environment satu lagi supaya pesan errornya bisa menunjuk key yang
+      // tepat, bukan sekadar "401" yang membingungkan.
+      const otherMode: MidtransMode = effectiveMode === 'production' ? 'sandbox' : 'production';
+      const otherCheck = await verifyServerKey(MIDTRANS_BASE_URL[otherMode], cleanKey).catch(() => null);
+
+      const hint = otherCheck?.valid
+        ? `Key ini justru DITERIMA di environment ${otherMode.toUpperCase()}. `
+          + `Jadi ini ${otherMode === 'sandbox' ? 'Sandbox' : 'Production'} Server Key, `
+          + `bukan ${effectiveMode === 'sandbox' ? 'Sandbox' : 'Production'} Server Key.`
+        : effectiveMode === 'production'
+          ? 'Pastikan Anda menyalin Production Server Key (SK-Mid-server-...) dari Dashboard > Settings > Access Keys.'
+          : 'Pastikan Anda menyalin Sandbox Server Key (SB-Mid-server-...) dari Sandbox Dashboard > Settings > Access Keys.';
+
       return c.json({
         success: false,
-        message: `Midtrans menolak Server Key ini di environment ${effectiveMode} (${check.detail}). `
-          + (effectiveMode === 'production'
-            ? 'Pastikan Anda menyalin Production Server Key (SK-Mid-server-...) dari Dashboard > Settings > Access Keys.'
-            : 'Pastikan Anda menyalin Sandbox Server Key (SB-Mid-server-...) dari Sandbox Dashboard > Settings > Access Keys.'),
+        message: `Midtrans menolak Server Key ini di environment ${effectiveMode} (${check.detail}). ${hint}`,
+        tested_mode: effectiveMode,
+        other_mode_accepted: !!otherCheck?.valid,
       }, 400);
     }
   } catch {
@@ -565,7 +582,7 @@ app.post('/admin/midtrans/config', async (c) => {
     // berikutnya akan memberi tahu jika kredensialnya benar-benar salah.
   }
 
-  if (typedKey && !envManaged) {
+  if (typedKey) {
     await setSetting(c.env, 'MIDTRANS_SERVER_KEY', typedKey);
   }
   await setSetting(c.env, 'MIDTRANS_MODE', effectiveMode);
