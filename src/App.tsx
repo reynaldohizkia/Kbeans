@@ -118,6 +118,9 @@ export default function App() {
   const [copiedVa, setCopiedVa] = useState(false);
 
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Pesan error mentah dari server, dipakai kalau parsing JSON gagal.
+  // Cukup variabel lokal: hanya dibaca di dalam satu pemanggilan placeOrder.
+  let lastRequestError = '';
 
   // Dua sumber QR, tergantung gateway:
   //   qrString -> dirender sendiri di browser (Xendit)
@@ -250,6 +253,7 @@ export default function App() {
     setQrUrl('');
     setVaNumber('');
     setVaBank('');
+    lastRequestError = '';
     try {
       const res = await fetch('/api/orders', {
         method: 'POST',
@@ -282,7 +286,22 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ order_id: data.order_id, payment_method: paymentMethod }),
       });
-      const chargeData = await chargeRes.json();
+
+      // Baca body sebagai teks dulu supaya error dari server (JSON maupun
+      // non-JSON) tetap bisa ditampilkan apa adanya.
+      const rawBody = await chargeRes.text();
+      let chargeData: any = null;
+      try {
+        chargeData = rawBody ? JSON.parse(rawBody) : null;
+      } catch {
+        chargeData = null;
+      }
+
+      if (!chargeData) {
+        lastRequestError = `Server membalas HTTP ${chargeRes.status} dengan respons yang tidak bisa dibaca. `
+          + (rawBody ? `Isi: ${rawBody.slice(0, 200)}` : 'Respons kosong.');
+        throw new Error(lastRequestError);
+      }
 
       // Gateway menolak? Tampilkan error aslinya. Jangan pernah menampilkan QR
       // pengganti, karena QR palsu hanya bisa "dipindai" tapi tidak bisa dibayar.
@@ -309,9 +328,12 @@ export default function App() {
         setVaBank(chargeData.va_bank || chargeData.bank || '');
       }
     } catch (e) {
+      // Jangan hanya melaporkan "kesalahan jaringan": kalau server membalas
+      // HTML atau teks biasa (mis. 502 dari edge), .json() akan melempar error
+      // dan penyebab aslinya ikut hilang. Ambil isi respons apa adanya.
       console.error(e);
       setCheckoutStep('payment');
-      setChargeError('Terjadi kesalahan jaringan saat membuat pembayaran.');
+      setChargeError(lastRequestError || 'Tidak bisa menghubungi server. Periksa koneksi internet Anda.');
     } finally {
       setPlacingOrder(false);
     }
