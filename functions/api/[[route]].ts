@@ -1,6 +1,21 @@
 ﻿import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { handle } from 'hono/cloudflare-pages';
+import {
+  getActiveProvider,
+  getActiveProviderId,
+  getProvider,
+  getProviderForOrder,
+  providerList,
+  setActiveProviderId,
+  getSetting,
+  setSetting,
+  sha256Hex,
+  getMidtransBaseUrl,
+  type PaymentMethod,
+  type ProviderId,
+} from '../_lib/payments/index';
+import { midtransVerifyWebhook, mapMidtransTransactionStatus } from '../_lib/payments/midtrans-webhook';
 
 type Bindings = {
   DB?: any;          // Binding ke Cloudflare D1
@@ -11,36 +26,12 @@ type Bindings = {
   MIDTRANS_CLIENT_KEY?: string;
   MIDTRANS_MODE?: string;         // 'production' | 'sandbox' (opsional, bila key tidak bisa dideteksi)
   MIDTRANS_QRIS_ACQUIRER?: string; // 'gopay' | 'airpay shopee'
+  XENDIT_SECRET_KEY?: string;
+  XENDIT_CALLBACK_TOKEN?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>().basePath('/api');
 app.use('*', cors());
-
-type MidtransMode = 'production' | 'sandbox';
-
-// Base URL resmi Midtrans Core API untuk tiap environment.
-const MIDTRANS_BASE_URL: Record<MidtransMode, string> = {
-  production: 'https://api.midtrans.com',
-  sandbox: 'https://api.sandbox.midtrans.com',
-};
-
-// Acquirer QRIS yang didukung Midtrans. QRIS hanya bisa dibuat lewat acquirer
-// yang sudah diaktifkan di Dashboard Midtrans, jadi urutan fallback di bawah
-// selalu mencoba acquirer yang paling umum terlebih dahulu.
-const MIDTRANS_QRIS_ACQUIRERS = ['gopay', 'airpay shopee'] as const;
-
-// Menentukan environment dari format Server Key Midtrans:
-//   Sandbox    -> SB-Mid-server-xxxxxxxx
-//   Production -> SK-Mid-server-xxxxxxxx / Mid-server-xxxxxxxx
-// Key sandbox TIDAK PERNAH bisa diautentikasi ke api.midtrans.com (dan
-// sebaliknya), jadi prefix key adalah sumber kebenaran paling akurat.
-const detectModeFromServerKey = (serverKey: string): MidtransMode | null => {
-  const key = serverKey.trim();
-  if (!key) return null;
-  if (/^SB-Mid-server-/i.test(key)) return 'sandbox';
-  if (/^(SK-)?Mid-server-/i.test(key)) return 'production';
-  return null;
-};
 
 // ------------------------------------------------------------------
 // GET /api/products
@@ -200,131 +191,24 @@ const initAuthSchema = async (db: any) => {
   await seedDefaultUsers(db);
 };
 
-// Menjamin kolom Midtrans di tabel orders tersedia. Kolomnya dibuat lewat
-// migration; di sini hanya dibaca, dan bila kosong seluruh fitur QRIS/VA
-// otomatis dinonaktifkan dengan pesan yang jelas.
-const hasOrderMidtransColumns = async (db: any) => {
+
+
+// Helper settings, schema, dan fingerprint sekarang tinggal di
+// ../_lib/payments: seluruh logika per-gateway dipindah ke masing-masing
+// provider, sehingga route ini tidak perlu tahu detail Midtrans maupun Xendit.
+
+// Kolom payment_* menyimpan provider dan id transaksi aktif, dipakai supaya
+// order yang dibuat sebelum provider diganti tetap bisa dicek statusnya.
+const hasPaymentColumns = async (db: any) => {
   if (!db) return false;
   try {
     const { results } = await db.prepare('PRAGMA table_info(orders)').all();
     const names = new Set((results || []).map((r: any) => r.name));
-    return names.has('midtrans_order_id') && names.has('midtrans_qr_url');
+    return names.has('payment_provider') && names.has('payment_external_id');
   } catch {
     return false;
   }
 };
-
-// Membaca satu nilai dari tabel settings. Tabel dibuat lewat migration
-// (migration_auth_settings.sql); kalau belum ada, nilainya dianggap kosong
-// supaya route lain tetap bisa jalan.
-const getSetting = async (env: Bindings, key: string): Promise<string> => {
-  if (!env.DB) return '';
-  try {
-    const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first();
-    return row?.value ? String(row.value) : '';
-  } catch {
-    return '';
-  }
-};
-
-// Menyimpan satu nilai ke tabel settings
-const setSetting = async (env: Bindings, key: string, value: string) => {
-  if (!env.DB) return;
-  await env.DB.prepare(`
-    INSERT INTO settings (key, value, updated_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
-  `).bind(key, value).run();
-};
-
-const maskSecret = (value: string) =>
-  value
-    ? value.substring(0, Math.min(8, value.length)) +
-      '••••••••' +
-      (value.length > 12 ? value.substring(value.length - 4) : '')
-    : '';
-
-export interface MidtransConfig {
-  serverKey: string;
-  mode: MidtransMode;
-  baseUrl: string;
-  acquirer: string;
-  keySource: string;
-  modeSource: string;
-}
-
-// Sidik jari Server Key, dipakai untuk mengikat mode yang sudah diverifikasi
-// ke key spesifik itu. Tanpa ini, mode lama ikut terpakai setelah key diganti
-// sehingga transaksi diarahkan ke environment yang salah.
-const serverKeyFingerprint = async (serverKey: string): Promise<string> => {
-  if (!serverKey) return '';
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serverKey));
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, 32);
-};
-
-// Mengambil seluruh konfigurasi Midtrans: Server Key, environment (production /
-// sandbox), base URL, dan acquirer QRIS. Environment ditentukan dari prefix
-// Server Key, sehingga Key produksi otomatis memakai api.midtrans.com.
-//
-// Key yang disimpan lewat Panel Admin (tabel settings) didahulukan atas
-// Environment Variable Cloudflare, supaya key bisa diperbarui dari browser
-// tanpa harus membuka dashboard Cloudflare. Env var tetap dipakai sebagai
-// nilai awal / cadangan.
-const getMidtransConfig = async (env: Bindings): Promise<MidtransConfig> => {
-  const envKey = (env.MIDTRANS_SERVER_KEY || '').trim();
-  const dbKey = (await getSetting(env, 'MIDTRANS_SERVER_KEY')).trim();
-  const serverKey = dbKey || envKey;
-
-  const storedMode = ((await getSetting(env, 'MIDTRANS_MODE')) || env.MIDTRANS_MODE || '')
-    .trim()
-    .toLowerCase();
-  const storedIsValidMode = storedMode === 'sandbox' || storedMode === 'production';
-  const fallbackMode: MidtransMode = storedMode === 'sandbox' ? 'sandbox' : 'production';
-
-  // Mode hasil verifikasi hanya dipercaya bila menyangkut key yang sama
-  // persis. Begitu key diganti, app kembali menebak dari prefix sampai key
-  // baru diverifikasi ulang lewat Panel Admin.
-  const verifiedFingerprint = await getSetting(env, 'MIDTRANS_VERIFIED_KEY');
-  const modeVerified = !!verifiedFingerprint
-    && verifiedFingerprint === await serverKeyFingerprint(serverKey);
-
-  const detected = detectModeFromServerKey(serverKey);
-  const mode = modeVerified && storedIsValidMode ? storedMode as MidtransMode : detected || fallbackMode;
-
-
-  const storedAcquirer = ((await getSetting(env, 'MIDTRANS_QRIS_ACQUIRER')) || env.MIDTRANS_QRIS_ACQUIRER || '')
-    .trim()
-    .toLowerCase();
-  const acquirer = (MIDTRANS_QRIS_ACQUIRERS as readonly string[]).includes(storedAcquirer)
-    ? storedAcquirer
-    : MIDTRANS_QRIS_ACQUIRERS[0];
-
-  return {
-    serverKey,
-    mode,
-    baseUrl: MIDTRANS_BASE_URL[mode],
-    acquirer,
-    keySource: dbKey ? 'Database Settings' : envKey ? 'Cloudflare Environment' : 'Belum Diatur',
-    modeSource: modeVerified
-      ? 'terverifikasi ke Midtrans'
-      : detected
-        ? 'deteksi otomatis dari Server Key'
-        : 'pengaturan manual',
-  };
-};
-
-const basicAuthHeader = (serverKey: string) =>
-  `Basic ${btoa(`${serverKey}:`)}`;
-
-const midtransHeaders = (serverKey: string) => ({
-  Accept: 'application/json',
-  'Content-Type': 'application/json',
-  Authorization: basicAuthHeader(serverKey),
-});
-
 // ------------------------------------------------------------------
 // Password disimpan sebagai hash SHA-256, bukan teks biasa. Password lama yang
 // masih tersimpan polos tetap bisa login lalu otomatis di-upgrade ke hash.
@@ -503,165 +387,184 @@ app.patch('/admin/orders/:id/status', async (c) => {
   return c.json({ success: true });
 });
 
-// ------------------------------------------------------------------
-// GET /api/admin/midtrans/config
-// Cek status integrasi Midtrans untuk panel admin
-// ------------------------------------------------------------------
-app.get('/admin/midtrans/config', async (c) => {
-  const key = c.req.header('x-admin-key');
-  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
-    return c.json({ success: false, message: 'Unauthorized' }, 401);
-  }
-
-  const config = await getMidtransConfig(c.env);
-
-  return c.json({
-    success: true,
-    has_key: !!config.serverKey,
-    masked_key: maskSecret(config.serverKey),
-    source: config.keySource,
-    mode: config.mode,
-    mode_source: config.modeSource,
-    base_url: config.baseUrl,
-    acquirer: config.acquirer,
-  });
-});
-
-// Menguji apakah sebuah Server Key diterima oleh environment tertentu.
-// Endpoint ini hanya memvalidasi kredensial, tidak membuat transaksi apa pun:
-//   401/403 -> key ditolak / tidak cocok dengan environment
-//   404     -> key valid, order id memang tidak ada (arti autentikasi berhasil)
-const verifyServerKey = async (baseUrl: string, serverKey: string) => {
-  const headers = { Accept: 'application/json', Authorization: basicAuthHeader(serverKey) };
-
-  const listRes = await fetch(`${baseUrl}/v2/transactions?page=1&limit=1`, { headers });
-  if (listRes.status === 401 || listRes.status === 403) {
-    return { valid: false, reason: 'rejected' as const, detail: `HTTP ${listRes.status}` };
-  }
-  if (listRes.ok) return { valid: true, reason: 'ok' as const, detail: '' };
-
-  // Beberapa tipe akun tidak punya akses daftar transaksi, jadi dicoba lewat
-  // endpoint status. Di sini 404 justru Tandanya kredensial sudah benar.
-  const statusRes = await fetch(`${baseUrl}/v2/kbeans-key-check/status`, { headers });
-  if (statusRes.status === 401 || statusRes.status === 403) {
-    return { valid: false, reason: 'rejected' as const, detail: `HTTP ${statusRes.status}` };
-  }
-  return { valid: true, reason: 'ok' as const, detail: '' };
+// Nama setting per provider. Dipisah supaya menambah gateway baru cukup
+// menambah satu entri di sini.
+const PROVIDER_KEY_SETTING: Record<ProviderId, string> = {
+  midtrans: 'MIDTRANS_SERVER_KEY',
+  xendit: 'XENDIT_SECRET_KEY',
+};
+const PROVIDER_FINGERPRINT_SETTING: Record<ProviderId, string> = {
+  midtrans: 'MIDTRANS_VERIFIED_KEY',
+  xendit: 'XENDIT_VERIFIED_KEY',
+};
+const PROVIDER_KEY_ENV_VAR: Record<ProviderId, string> = {
+  midtrans: 'MIDTRANS_SERVER_KEY',
+  xendit: 'XENDIT_SECRET_KEY',
 };
 
+const providerKeySetting = (id: ProviderId) => PROVIDER_KEY_SETTING[id];
+const providerFingerprintSetting = (id: ProviderId) => PROVIDER_FINGERPRINT_SETTING[id];
+const providerKeyEnvVar = (id: ProviderId) => PROVIDER_KEY_ENV_VAR[id];
+
 // ------------------------------------------------------------------
-// POST /api/admin/midtrans/config
-// Simpan dan uji Server Key Midtrans langsung dari panel admin.
-// Environment (production/sandbox) ditentukan otomatis dari prefix Server Key.
-//
-// server_key boleh dikosongkan kalau key sudah ada: dipakai untuk menyimpan
-// mode / acquirer saja tanpa mengetik ulang kunci yang sudah jalan.
+// GET /api/admin/payments/config
+// Status integrasi payment gateway untuk Panel Admin. Menyediakan daftar
+// provider yang tersedia plus status provider yang sedang aktif.
 // ------------------------------------------------------------------
-app.post('/admin/midtrans/config', async (c) => {
+const handlePaymentsConfig = async (c: any) => {
   const key = c.req.header('x-admin-key');
   if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
-  const { server_key, mode, qris_acquirer } = await c.req.json();
-  const typedKey = String(server_key || '').trim();
+  const activeId = await getActiveProviderId(c.env);
 
-  let current = await getMidtransConfig(c.env);
-  if (!typedKey && !current.serverKey) {
-    return c.json({ success: false, message: 'Server Key tidak boleh kosong' }, 400);
-  }
-
-  const cleanKey = typedKey || current.serverKey;
-  const detectedMode = detectModeFromServerKey(cleanKey);
-  const requestedMode: MidtransMode = String(mode).toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
-
-  const requestedAcquirer = String(qris_acquirer || '').trim().toLowerCase();
-  const acquirer = (MIDTRANS_QRIS_ACQUIRERS as readonly string[]).includes(requestedAcquirer)
-    ? requestedAcquirer
-    : MIDTRANS_QRIS_ACQUIRERS[0];
-
-  // Prefix Server Key tidak selalu bisa dipercaya: key sandbox versi lama
-  // berformat 'Mid-server-...' sama persis dengan key production. Jadi kedua
-  // environment dicoba, dan yang dipakai adalah yang benar-benar mengizinkan
-  // key ini -- bukan yang mana pun hasil tebakan prefix.
-  const tryModes: MidtransMode[] = (() => {
-    const first = detectedMode || requestedMode;
-    const second: MidtransMode = first === 'production' ? 'sandbox' : 'production';
-    return [first, second];
-  })();
-
-  let effectiveMode: MidtransMode | null = null;
-  let verified = false;
-  const rejections: string[] = [];
-
-  try {
-    for (const mode of tryModes) {
-      const check = await verifyServerKey(MIDTRANS_BASE_URL[mode], cleanKey);
-      if (check.valid) {
-        effectiveMode = mode;
-        verified = true;
-        break;
-      }
-      rejections.push(`${mode} (${check.detail})`);
-    }
-  } catch {
-    // Jaringan ke Midtrans tidak bisa dicek saat ini. Simpan saja; charge
-    // berikutnya akan memberi tahu kalau kredensialnya benar-benar salah.
-  }
-
-  if (!effectiveMode) {
-    const networkIssue = rejections.length === 0;
-    return c.json({
-      success: false,
-      message: networkIssue
-        ? 'Tidak bisa menghubungi server Midtrans untuk memverifikasi Server Key. Coba lagi beberapa saat lagi.'
-        : `Midtrans menolak Server Key ini di kedua environment (${rejections.join(', ')}). `
-          + 'Salin ulang dari Midtrans Dashboard > Settings > Access Keys, lalu paste di sini.',
-      rejected_in: rejections,
-    }, 400);
-  }
-
-  const prefixGuessedWrong = detectedMode !== null && detectedMode !== effectiveMode;
-
-  if (typedKey) {
-    await setSetting(c.env, 'MIDTRANS_SERVER_KEY', typedKey);
-  }
-  await setSetting(c.env, 'MIDTRANS_MODE', effectiveMode);
-  await setSetting(c.env, 'MIDTRANS_QRIS_ACQUIRER', acquirer);
-
-  // Ikat mode ke key ini, supaya mengganti key otomatis membatalkan mode lama.
-  await setSetting(
-    c.env,
-    'MIDTRANS_VERIFIED_KEY',
-    verified ? await serverKeyFingerprint(cleanKey) : ''
+  // Ringkasan semua provider, supaya Panel Admin bisa menampilkan status
+  // masing-masing tanpa request terpisah.
+  const providers = await Promise.all(
+    providerList().map(async (meta) => {
+      const provider = getProvider(meta.id);
+      const [info, ready, keyMask, keySrc] = await Promise.all([
+        provider.describe(c.env),
+        provider.hasKey(c.env),
+        provider.maskedKey(c.env),
+        provider.keySource(c.env),
+      ]);
+      return {
+        ...meta,
+        has_key: ready,
+        masked_key: keyMask,
+        key_source: keySrc,
+        mode: info.mode,
+        mode_source: info.source,
+        base_url: info.baseUrl,
+        verified: info.verified,
+      };
+    })
   );
 
-  current = await getMidtransConfig(c.env);
+  const activeInfo = providers.find((p) => p.id === activeId) || {
+    has_key: false,
+    masked_key: '',
+    key_source: 'Belum Diatur',
+    mode: '',
+    mode_source: '',
+    base_url: '',
+    verified: false,
+  };
 
+  return c.json({
+    success: true,
+    active_provider: activeId,
+    has_key: activeInfo.has_key,
+    masked_key: activeInfo.masked_key,
+    source: activeInfo.key_source,
+    mode: activeInfo.mode,
+    mode_source: activeInfo.mode_source,
+    base_url: activeInfo.base_url,
+    verified: activeInfo.verified,
+    providers,
+  });
+};
+
+app.get('/admin/payments/config', handlePaymentsConfig);
+// Alias lama agar klien yang masih memakai path ini tidak langsung rusak.
+app.get('/admin/midtrans/config', handlePaymentsConfig);
+
+
+// ------------------------------------------------------------------
+// POST /api/admin/payments/config
+// Simpan dan uji credential payment gateway dari Panel Admin.
+//
+// credential boleh dikosongkan kalau sudah ada: dipakai untuk berpindah
+// provider atau menyesuaikan opsi tanpa mengetik ulang kunci yang jalan.
+// ------------------------------------------------------------------
+const handleSavePaymentsConfig = async (c: any) => {
+
+  const key = c.req.header('x-admin-key');
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
+    return c.json({ success: false, message: 'Unauthorized' }, 401);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const providerId = (String(body.provider || '').trim().toLowerCase() || await getActiveProviderId(c.env)) as ProviderId;
+  const provider = getProvider(providerId);
+  if (!provider) {
+    return c.json({ success: false, message: `Provider tidak dikenal: ${providerId}` }, 400);
+  }
+
+  const typedKey = String(body.secret_key ?? body.server_key ?? '').trim();
   const notes: string[] = [];
-  if (prefixGuessedWrong) {
-    notes.push(
-      `Awalan key terlihat seperti ${detectedMode}, tapi Midtrans hanya menerimanya di ${effectiveMode.toUpperCase()}. `
-      + 'Mode sudah disesuaikan otomatis.'
+
+  if (typedKey) {
+    // Verifikasi dulu: jangan simpan credential yang ditolak gateway.
+    const check = await provider.verifyKey(c.env, typedKey, {
+      mode: body.mode,
+      qris_acquirer: body.qris_acquirer,
+    });
+
+    if (!check.ok) {
+      return c.json({
+        success: false,
+        message: `${provider.label} menolak credential ini${check.detail ? ` (${check.detail})` : ''}.`,
+        notes: check.notes || [],
+      }, 400);
+    }
+
+    notes.push(...(check.notes || []));
+
+    const envKey = String((c.env as any)[providerKeyEnvVar(providerId)] || '').trim();
+    // Key dari form hanya disimpan kalau berbeda dari key yang sudah dikelola
+    // Cloudflare Environment, karena env var selalu menang saat dibaca.
+    if (envKey !== typedKey) {
+      await setSetting(c.env, providerKeySetting(providerId), typedKey);
+    }
+
+    await setSetting(
+      c.env,
+      providerFingerprintSetting(providerId),
+      await sha256Hex(typedKey)
     );
   }
-  if (effectiveMode === 'sandbox') {
-    notes.push('Mode SANDBOX: QRIS hanya bisa diuji lewat simulator Midtrans, tidak bisa dibayar dengan GoPay/OVO sungguhan.');
+
+  if (body.provider) {
+    await setActiveProviderId(c.env, providerId);
+  }
+
+  const activeId = await getActiveProviderId(c.env);
+  const activeProvider = getProvider(activeId);
+  const [describe, masked, source, ready] = await Promise.all([
+    activeProvider.describe(c.env),
+    activeProvider.maskedKey(c.env),
+    activeProvider.keySource(c.env),
+    activeProvider.hasKey(c.env),
+  ]);
+
+  if (!ready) {
+    notes.push(`${activeProvider.label} belum punya credential, jadi pembayaran belum bisa diproses.`);
+
   }
 
   return c.json({
     success: true,
-    message: `Server Key terverifikasi di ${effectiveMode.toUpperCase()}. ${notes.join(' ')}`.trim(),
-    masked_key: maskSecret(current.serverKey),
-    mode: current.mode,
-    mode_source: verified ? 'terverifikasi ke Midtrans' : current.modeSource,
-    base_url: current.baseUrl,
-    acquirer: current.acquirer,
-    key_source: current.keySource,
-    verified,
+    message: typedKey
+      ? `Credential ${provider.label} tersimpan.`
+      : 'Pengaturan pembayaran tersimpan.',
+    active_provider: activeId,
+    masked_key: masked,
+    key_source: source,
+    mode: describe.mode,
+    mode_source: describe.source,
+    base_url: describe.baseUrl,
+    verified: describe.verified,
     notes,
   });
-});
+};
+
+// Alias lama agar klien yang masih memakai path ini tidak langsung rusak.
+app.post('/admin/payments/config', handleSavePaymentsConfig);
+app.post('/admin/midtrans/config', handleSavePaymentsConfig);
+
 
 // ------------------------------------------------------------------
 // POST /api/auth/change-password
@@ -772,17 +675,17 @@ app.post('/orders', async (c) => {
 });
 
 // ------------------------------------------------------------------
-// POST /api/midtrans/charge
-// Membuat transaksi SUNGGUHAN di Midtrans (Core API) untuk order yang baru
-// dibuat, lalu mengembalikan info pembayaran (QRIS / Virtual Account) ke
-// frontend. Environment ditentukan otomatis dari prefix Server Key, sehingga
-// Server Key produksi memakai https://api.midtrans.com.
+// POST /api/payments/charge
+// Membuat transaksi NYATA di payment gateway yang aktif untuk order yang baru
+// dibuat, lalu mengembalikan instruksi pembayaran (QRIS / Virtual Account).
+// Route ini tidak tahu gateway apa pun yang dipakai: semua perbedaan
+//ditangani masing-masing provider di ../_lib/payments.
 //
-// Penting: kalau Midtrans menolak transaksi, endpoint ini mengembalikan
-// error yang apa adanya. Ia TIDAK PERNAH memalsukan QR_CODE / nomor VA,
-// karena QR palsu hanya bisa "dipindai" tapi tidak bisa dibayar.
+// Penting: kalau gateway menolak, endpoint ini mengembalikan error yang apa
+// adanya. Ia TIDAK PERNAH memalsukan QR atau nomor VA, karena QR palsu hanya
+// bisa "dipindai" tapi tidak bisa dibayar.
 // ------------------------------------------------------------------
-app.post('/midtrans/charge', async (c) => {
+const handleCharge = async (c: any) => {
   try {
     const { order_id, payment_method } = await c.req.json();
 
@@ -790,221 +693,133 @@ app.post('/midtrans/charge', async (c) => {
       return c.json({ success: false, message: 'Database tidak tersedia' }, 500);
     }
 
-    const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(order_id).first();
+    const order: any = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(order_id).first();
     if (!order) {
       return c.json({ success: false, message: 'Order tidak ditemukan' }, 404);
     }
 
-    const config = await getMidtransConfig(c.env);
-    if (!config.serverKey) {
+    if (!(await hasPaymentColumns(c.env.DB))) {
       return c.json({
         success: false,
-        message: 'Server Key Midtrans belum diatur. Buka Dashboard Admin > Pengaturan Midtrans, lalu simpan Server Key Anda.',
-      }, 400);
-    }
-
-    // Tanpa kolom midtrans_* transaksi tidak bisa ditautkan ke order, jadi QR
-    // yang dibuat tidak akan pernahUpdating status pembayaran.
-    if (!(await hasOrderMidtransColumns(c.env.DB))) {
-      return c.json({
-        success: false,
-        message: 'Kolom midtrans_order_id / midtrans_qr_url belum ada di tabel orders. '
+        message: 'Kolom payment_provider / payment_external_id belum ada di tabel orders. '
           + 'Jalankan: npx wrangler d1 execute kbeans-db --remote --file=migration_auth_settings.sql',
       }, 500);
     }
 
-    // Midtrans mewajibkan order_id unik yang belum pernah dipakai (maks 50 karakter).
-    const midtransOrderId = `${order.order_number}-${Date.now()}`;
+    const provider = await getActiveProvider(c.env);
+    const method = String(payment_method) as PaymentMethod;
+    const origin = new URL(c.req.url).origin;
 
-    const grossAmount = Math.round(Number(order.total_amount));
-    if (!Number.isFinite(grossAmount) || grossAmount < 1000) {
+    // reference id harus unik per transaksi, jadi timestamp ditambahkan.
+    const referenceId = `${order.order_number}-${Date.now()}`;
+
+    const result = await provider.createPayment({
+      env: c.env,
+      order,
+      method,
+      referenceId,
+      origin,
+    });
+
+    if (!result.ok) {
       return c.json({
         success: false,
-        message: `Total pembayaran tidak valid untuk Midtrans (minimal Rp1.000). Nilai saat ini: ${grossAmount}.`,
-      }, 400);
-    }
-
-    // Midtrans menolak nama/email berisi karakter khusus, jadi dibersihkan dulu.
-    const cleanName = String(order.customer_name || 'Pelanggan')
-      .replace(/[^a-zA-Z0-9 .,'-]/g, ' ')
-      .trim()
-      .slice(0, 40) || 'Pelanggan';
-    const cleanPhone = String(order.customer_phone || '').replace(/[^0-9+]/g, '').slice(0, 20);
-    const cleanEmail = order.customer_email
-      ? String(order.customer_email).replace(/[^a-zA-Z0-9@._-]/g, '').slice(0, 50)
-      : '';
-
-    const transactionDetails = { order_id: midtransOrderId, gross_amount: grossAmount };
-    const customerDetails: Record<string, string> = {
-      first_name: cleanName,
-      ...(cleanPhone ? { phone: cleanPhone } : {}),
-      ...(cleanEmail ? { email: cleanEmail } : {}),
-    };
-
-    const callMidtrans = async (payload: any) => {
-      const res = await fetch(`${config.baseUrl}/v2/charge`, {
-        method: 'POST',
-        headers: midtransHeaders(config.serverKey),
-        body: JSON.stringify(payload),
-      });
-      const data: any = await res.json().catch(() => ({}));
-      return { httpStatus: res.status, data };
-    };
-
-    const isCreated = (data: any) => ['200', '201'].includes(String(data?.status_code));
-
-    // Satu percobaan charge. Return error dalam bentuk yang bisa ditampilkan
-    // ke pengguna, plus penanda apakah transaksi sudah terlanjur dibuat.
-    type ChargeAttempt = { ok: true; data: any } | { ok: false; message: string; transactionCreated: boolean };
-    const attemptCharge = async (payload: any): Promise<ChargeAttempt> => {
-      try {
-        const { httpStatus, data } = await callMidtrans(payload);
-        if (isCreated(data)) return { ok: true, data };
-
-        const message = data?.status_message
-          || (httpStatus === 401 || httpStatus === 403
-            ? 'Server Key ditolak oleh Midtrans (401/403). Periksa lagi Server Key dan environment-nya.'
-            : `Midtrans menolak transaksi (HTTP ${httpStatus}).`);
-
-        return { ok: false, message, transactionCreated: !!data?.transaction_id };
-      } catch (err: any) {
-        return {
-          ok: false,
-          message: `Gagal menghubungi server Midtrans (${config.baseUrl}): ${err?.message || 'Network error'}`,
-          transactionCreated: false,
-        };
-      }
-    };
-
-    // Daftar payload yang dicoba berurutan. QRIS di Midtrans WAJIB memakai
-    // acquirer (hanya GoPay dan AirPay Shopee yang didukung), jadi kandidat
-    // acquirer_other dicoba lebih dulu, lalu fallback ke gopay / airpay shopee
-    // bila acquirer tersebut belum diaktifkan di akun Midtrans Anda.
-    const bankChain = ['bca', 'permata', 'mandiri'];
-    const qrisAcquirerChain = [config.acquirer, ...MIDTRANS_QRIS_ACQUIRERS.filter((a) => a !== config.acquirer)];
-
-    const buildPayloads = (): any[] => {
-      if (payment_method === 'bca_va') {
-        return bankChain.map((bank) => ({
-          payment_type: 'bank_transfer',
-          transaction_details: transactionDetails,
-          bank_transfer: { bank },
-          customer_details: customerDetails,
-        }));
-      }
-
-      const payloads: any[] = qrisAcquirerChain.map((acquirer) => ({
-        payment_type: 'qris',
-        transaction_details: transactionDetails,
-        qris: { acquirer },
-        customer_details: customerDetails,
-      }));
-
-      // Tanpa acquirer: dipakai kalau akun Midtrans memakai QRIS generik BI.
-      payloads.push({
-        payment_type: 'qris',
-        transaction_details: transactionDetails,
-        customer_details: customerDetails,
-      });
-
-      return payloads;
-    };
-
-    const failures: string[] = [];
-    let successData: any = null;
-
-    for (const payload of buildPayloads()) {
-      const result = await attemptCharge(payload);
-      if (result.ok) {
-        successData = result.data;
-        break;
-      }
-      failures.push(result.message);
-      // Kalau Midtrans sudah membuat transaksi (misal status 202 deny), jangan
-      // mencoba lagi supaya tidak tercipta transaksi ganda untuk satu order.
-      if (result.transactionCreated) break;
-    }
-
-    if (!successData) {
-      const uniqueFailures = [...new Set(failures)];
-      return c.json({
-        success: false,
-        mode: config.mode,
-        message: uniqueFailures[0] || 'Midtrans tidak memberikan respons.',
-        failures: uniqueFailures,
-        hint: config.mode === 'production'
-          ? 'Pastikan channel QRIS sudah diaktifkan di Midtrans Dashboard > Settings > Payment Methods, dan acquirer (GoPay / AirPay Shopee) sudah aktif untuk akun Anda.'
-          : 'Pastikan channel QRIS tersedia di Sandbox Midtrans, atau ganti mode ke Production pada Pengaturan Midtrans.',
+        provider: provider.id,
+        provider_label: provider.label,
+        message: result.message,
+        hint: result.hint,
+        failures: result.failures,
       }, 502);
     }
 
-    // Transaksi NYATA berhasil dibuat. Simpan referensi transaksinya ke D1
-    // supaya status bisa dicek ulang ke Midtrans kapan saja. Kolom midtrans_*
-    // sudah dipastikan ada di awal handler ini.
-    await c.env.DB.prepare('UPDATE orders SET midtrans_order_id = ? WHERE id = ?')
-      .bind(midtransOrderId, order_id)
-      .run();
+    const instruction = result.instruction;
 
-    if (payment_method === 'bca_va') {
-      const vaNumber =
-        successData.va_numbers?.[0]?.va_number ||
-        successData.permata_va_number ||
-        successData.bank_details?.va_number ||
-        '';
+    await c.env.DB.prepare(
+      'UPDATE orders SET payment_provider = ?, payment_external_id = ? WHERE id = ?'
+    ).bind(provider.id, instruction.externalId, order_id).run();
 
-      if (!vaNumber) {
-        return c.json({
-          success: false,
-          message: 'Midtrans membuat transaksi Virtual Account tanpa nomor VA. Coba muat ulang halaman.',
-        }, 502);
-      }
-
-      return c.json({
-        success: true,
-        mode: config.mode,
-        bank: successData.bank_details?.bank || successData.bank || successData.permata_bank || '',
-        va_number: vaNumber,
-        midtrans_order_id: midtransOrderId,
-        expires_at: successData.expiry_time || successData.va_expiration_time || '',
-      });
+    // Midtrans menyajikan QR sebagai gambar resmi dari gateway-nya, jadi URL-nya
+    // disimpan untuk dipakai endpoint proxy /api/midtrans/qr.
+    if (instruction.qrImageUrl) {
+      await c.env.DB.prepare('UPDATE orders SET midtrans_qr_url = ? WHERE id = ?')
+        .bind(instruction.qrImageUrl, order_id)
+        .run();
     }
-
-    // QRIS: gambar QR asli dibuat oleh Midtrans. URL-nya diteruskan lewat
-    // /api/midtrans/qr (proxy) supaya bisa diunduh tanpa masalah CORS.
-    const qrAction = successData.actions?.find((a: any) => a.name === 'generate-qr-code')
-      || successData.actions?.find((a: any) => a.name === 'generate-qr-code-v2');
-
-    if (!qrAction?.url) {
-      return c.json({
-        success: false,
-        message: 'Midtrans tidak mengembalikan QR code untuk transaksi ini. Periksa apakah channel QRIS sudah aktif di akun Midtrans Anda.',
-      }, 502);
-    }
-
-    await c.env.DB.prepare('UPDATE orders SET midtrans_qr_url = ? WHERE id = ?')
-      .bind(qrAction.url, order_id)
-      .run();
 
     return c.json({
       success: true,
-      mode: config.mode,
-      acquirer: successData.acquirer || config.acquirer,
-      qr_proxy_url: `/api/midtrans/qr?order_id=${encodeURIComponent(order_id)}`,
-      midtrans_order_id: midtransOrderId,
-      transaction_id: successData.transaction_id || '',
-      expires_at: successData.expiry_time || '',
+      provider: provider.id,
+      provider_label: provider.label,
+      external_id: instruction.externalId,
+      // Xendit mengirim string EMVCo; frontend yang merender QR-nya sendiri.
+      qr_string: instruction.qrString || undefined,
+      // Midtrans mengirim URL gambar; frontend memakainya lewat proxy.
+      qr_proxy_url: instruction.qrImageUrl
+        ? `/api/midtrans/qr?order_id=${encodeURIComponent(order_id)}`
+        : undefined,
+      va_number: instruction.vaNumber,
+      va_bank: instruction.vaBank,
+      expires_at: instruction.expiresAt,
+      amount: instruction.amount,
+      notes: instruction.notes,
     });
   } catch (err: any) {
     return c.json({ success: false, message: `Error tak terduga: ${err?.message || String(err)}` }, 500);
   }
+};
+
+app.post('/payments/charge', handleCharge);
+// Alias lama agar klien versi sebelumnya tidak langsung rusak.
+app.post('/midtrans/charge', handleCharge);
+
+// ------------------------------------------------------------------
+// POST /api/admin/payments/simulate
+// Menandai pembayaran lunas di mode test (Xendit). Hanya tersedia untuk
+// provider yang menyediakan endpoint simulasi, dan hanya di test mode.
+// ------------------------------------------------------------------
+app.post('/admin/payments/simulate', async (c) => {
+  const key = c.req.header('x-admin-key');
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
+    return c.json({ success: false, message: 'Unauthorized' }, 401);
+  }
+  if (!c.env.DB) {
+    return c.json({ success: false, message: 'Database tidak tersedia' }, 500);
+  }
+
+  const { order_id } = await c.req.json().catch(() => ({}));
+  if (!order_id) {
+    return c.json({ success: false, message: 'order_id wajib diisi' }, 400);
+  }
+
+  const order: any = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(order_id).first();
+  if (!order) {
+    return c.json({ success: false, message: 'Order tidak ditemukan' }, 404);
+  }
+
+  // Order lama yang belum di-tag provider dianggap Midtrans.
+  const provider = await getProviderForOrder(c.env, order);
+  if (!provider.simulate) {
+    return c.json({
+      success: false,
+      message: `${provider.label} tidak menyediakan endpoint simulasi. Untuk Midtrans sandbox, pakai Payment Simulator resmi Midtrans.`,
+    }, 400);
+  }
+
+  const result = await provider.simulate(c.env, order, Math.round(Number(order.total_amount)));
+  if (!result.ok) {
+    return c.json({ success: false, message: result.message }, 400);
+  }
+
+  return c.json({ success: true, message: result.message });
 });
 
 // ------------------------------------------------------------------
 // GET /api/midtrans/qr?order_id=...
-// Proxy gambar QRIS asli dari Midtrans. Dipakai frontend sebagai <img>.
-// Proxy ini penting karena: (1) URL QR Midtrans tidak selalu mengirim header
-// CORS sehingga browser bisa gagal saat mengunduhnya, dan (2) satu-satunya
-// cara memvalidasi order sebelum meneruskan gambar.
+// Proxy gambar QRIS resmi dari Midtrans. Hanya dipakai bila provider aktif
+// adalah Midtrans; Xendit mengirim string QR yang dirender di frontend.
+//
+// Proxy ini penting karena URL QR Midtrans tidak selalu mengirim header CORS,
+// sehingga browser bisa gagal saat mengunduh gambarnya.
 // ------------------------------------------------------------------
 app.get('/midtrans/qr', async (c) => {
   const orderId = c.req.query('order_id');
@@ -1012,61 +827,55 @@ app.get('/midtrans/qr', async (c) => {
     return c.json({ success: false, message: 'order_id wajib diisi' }, 400);
   }
 
-  // Kolom midtrans_* sudah dimigrasi; dicek di ensureOrderColumns di bawah.
-
   const order: any = await c.env.DB
-    .prepare('SELECT midtrans_order_id, midtrans_qr_url FROM orders WHERE id = ?')
+    .prepare('SELECT midtrans_qr_url, payment_external_id FROM orders WHERE id = ?')
     .bind(orderId)
     .first();
 
-  if (!order?.midtrans_order_id) {
+  if (!order?.midtrans_qr_url) {
     return c.json({ success: false, message: 'Transaksi QR untuk order ini belum dibuat' }, 404);
   }
 
-  const config = await getMidtransConfig(c.env);
-  if (!config.serverKey) {
+  const envKey = String(c.env.MIDTRANS_SERVER_KEY || '').trim();
+  const storedKey = (await getSetting(c.env, 'MIDTRANS_SERVER_KEY')).trim();
+  const serverKey = storedKey || envKey;
+  if (!serverKey) {
     return c.json({ success: false, message: 'Server Key Midtrans belum diatur' }, 500);
   }
 
-  // Sumber utama: URL QR yang disimpan saat charge berhasil. Ini membuat QR
-  // tetap tampil walau panggilan status ke Midtrans sedang gagal.
-  const candidates: string[] = order.midtrans_qr_url ? [order.midtrans_qr_url] : [];
+  const auth = `Basic ${btoa(`${serverKey}:`)}`;
 
-  // Cadangan: tanya status ke Midtrans. Dipakai juga untuk menolak QR yang
-  // transaksinya sudah kedaluwarsa / dibatalkan.
-  let statusChecked = false;
+  // Sumber utama: URL yang disimpan saat charge berhasil. Ini membuat QR tetap
+  // tampil walau panggilan status ke Midtrans sedang gagal.
+  const candidates: string[] = [order.midtrans_qr_url];
+
+  // Cadangan: tanya status ke Midtrans untuk menemukan URL QR yang lebih
+  // baru, sekaligus menolak QR yang transaksinya sudah tidak aktif.
   try {
-    const statusRes = await fetch(`${config.baseUrl}/v2/${order.midtrans_order_id}/status`, {
-      headers: { Accept: 'application/json', Authorization: basicAuthHeader(config.serverKey) },
-    });
-    if (statusRes.ok) {
-      const statusData: any = await statusRes.json().catch(() => ({}));
-      statusChecked = true;
-
-      if (statusData?.transaction_status && statusData.transaction_status !== 'pending') {
-        return c.json({
-          success: false,
-          message: `Transaksi sudah berstatus "${statusData.transaction_status}".`,
-          transaction_status: statusData.transaction_status,
-        }, 409);
-      }
-
-      const actions: any[] = statusData?.actions || [];
-      for (const action of actions) {
-        if (action?.name === 'generate-qr-code' || action?.name === 'generate-qr-code-v2') {
-          if (!candidates.includes(action.url)) candidates.push(action.url);
+    const externalId = order.payment_external_id || order.midtrans_order_id;
+    if (externalId) {
+      const baseUrl = await getMidtransBaseUrl(c.env);
+      const res = await fetch(`${baseUrl}/v2/${externalId}/status`, {
+        headers: { Accept: 'application/json', Authorization: auth },
+      });
+      if (res.ok) {
+        const data: any = await res.json().catch(() => ({}));
+        if (data?.transaction_status && data.transaction_status !== 'pending') {
+          return c.json({
+            success: false,
+            message: `Transaksi sudah berstatus "${data.transaction_status}".`,
+            transaction_status: data.transaction_status,
+          }, 409);
+        }
+        for (const action of data?.actions || []) {
+          if ((action?.name === 'generate-qr-code' || action?.name === 'generate-qr-code-v2') && action?.url) {
+            if (!candidates.includes(action.url)) candidates.push(action.url);
+          }
         }
       }
     }
   } catch {
     // Status tidak bisa dicek: tetap layani QR dari URL yang tersimpan.
-  }
-
-  if (candidates.length === 0 && !statusChecked) {
-    return c.json({
-      success: false,
-      message: 'Gambar QRIS belum tersedia. Muat ulang halaman pembayaran.',
-    }, 502);
   }
 
   for (const url of candidates) {
@@ -1090,116 +899,118 @@ app.get('/midtrans/qr', async (c) => {
 });
 
 // ------------------------------------------------------------------
-// GET /api/midtrans/status?order_id=...
-// Sinkronkan status pembayaran ke D1 dengan menanyakan langsung ke Midtrans.
-// Dengan begitu status tetap akurat meskipun webhook belum dikonfigurasi di
-// Dashboard Midtrans.
+// Sinkronisasi status pembayaran ke D1.
+//
+// Status ditanyakan langsung ke gateway, bukan hanya mengandalkan webhook,
+// sehingga layar pembeli tetap sampai ke "Berhasil" walau webhook belum
+// terdaftar di dashboard gateway.
 // ------------------------------------------------------------------
-const mapMidtransStatus = (transactionStatus: string | undefined): string | null => {
-  if (!transactionStatus) return null;
-  if (transactionStatus === 'settlement' || transactionStatus === 'capture') return 'settlement';
-  if (['deny', 'cancel', 'expire', 'failure', 'partial_refund', 'refund'].includes(transactionStatus)) {
-    return 'failed';
-  }
-  if (transactionStatus === 'pending') return 'pending';
-  return null;
-};
-
 const syncOrderStatus = async (env: Bindings, order: any) => {
   let paymentStatus = order.payment_status || 'pending';
-  let transactionStatus: string | undefined;
+  let rawStatus: string | undefined;
 
-  const config = await getMidtransConfig(env);
-  if (config.serverKey && order.midtrans_order_id && env.DB) {
-    try {
-      const res = await fetch(`${config.baseUrl}/v2/${order.midtrans_order_id}/status`, {
-        headers: { Accept: 'application/json', Authorization: basicAuthHeader(config.serverKey) },
-      });
-      if (res.ok) {
-        const data: any = await res.json().catch(() => ({}));
-        transactionStatus = data?.transaction_status;
-        const mapped = mapMidtransStatus(transactionStatus);
-        if (mapped && mapped !== paymentStatus) {
-          paymentStatus = mapped;
-          await env.DB.prepare('UPDATE orders SET payment_status = ? WHERE id = ?')
-            .bind(paymentStatus, order.id)
-            .run();
-        }
+  try {
+    const provider = await getProviderForOrder(env, order);
+    const result = await provider.fetchStatus(env, order);
+    if (result) {
+      rawStatus = result.rawStatus;
+      if (result.state !== paymentStatus && env.DB) {
+        paymentStatus = result.state;
+        await env.DB.prepare('UPDATE orders SET payment_status = ? WHERE id = ?')
+          .bind(paymentStatus, order.id)
+          .run();
       }
-    } catch {
-      // Jaringan ke Midtrans gagal: andalkan nilai terakhir yang tersimpan di D1.
     }
+  } catch {
+    // Jaringan ke gateway gagal: andalkan nilai terakhir yang tersimpan di D1.
   }
 
-  return { payment_status: paymentStatus, transaction_status: transactionStatus || null };
+  return { payment_status: paymentStatus, transaction_status: rawStatus || null, provider: order.payment_provider || 'midtrans' };
 };
 
-app.get('/midtrans/status', async (c) => {
+app.get('/payments/status', async (c) => {
   const orderId = c.req.query('order_id');
   if (!orderId || !c.env.DB) {
     return c.json({ success: false, message: 'order_id wajib diisi' }, 400);
   }
-
   const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(orderId).first();
   if (!order) {
     return c.json({ success: false, message: 'Order tidak ditemukan' }, 404);
   }
-
-  const status = await syncOrderStatus(c.env, order);
-  return c.json({ success: true, ...status });
+  return c.json({ success: true, ...(await syncOrderStatus(c.env, order)) });
 });
+app.get('/midtrans/status', (c) => c.redirect('/api/payments/status' + (c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : '')));
 
 // ------------------------------------------------------------------
-// POST /api/midtrans/notification
-// Webhook resmi Midtrans -- dipanggil otomatis oleh server Midtrans
-// setiap status transaksi berubah (pending/settlement/expire/dll).
-// URL ini yang didaftarkan di Midtrans Dashboard > Settings > Configuration.
+// Webhook Midtrans
 // ------------------------------------------------------------------
 const handleMidtransNotification = async (c: any) => {
-  const body: any = await c.req.json().catch(() => ({}));
-  const { order_id, status_code, gross_amount, signature_key, transaction_status } = body;
+  const body = await c.req.json().catch(() => ({}));
+  const result = await midtransVerifyWebhook(c.env, body);
 
-  if (!order_id || !signature_key) {
-    return c.json({ success: false, message: 'Payload notifikasi tidak lengkap' }, 400);
+  if (!result.ok) {
+    return c.json({ success: false, message: result.message }, result.status);
   }
 
-  const config = await getMidtransConfig(c.env);
-  if (!config.serverKey) {
-    return c.json({ success: false, message: 'Server Key belum diset' }, 500);
-  }
-
-  // Verifikasi signature supaya notifikasi ini benar-benar dari Midtrans,
-  // bukan orang lain yang berpura-pura mengirim status "sudah bayar".
-  const raw = `${order_id}${status_code}${gross_amount}${config.serverKey}`;
-  const hashBuffer = await crypto.subtle.digest('SHA-512', new TextEncoder().encode(raw));
-  const computedSignature = Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  if (computedSignature !== signature_key) {
-    return c.json({ success: false, message: 'Invalid signature' }, 403);
-  }
-
-  const paymentStatus = mapMidtransStatus(transaction_status);
+  const paymentStatus = mapMidtransTransactionStatus(result.transactionStatus);
   if (paymentStatus && c.env.DB) {
-    await c.env.DB.prepare('UPDATE orders SET payment_status = ? WHERE midtrans_order_id = ?')
-      .bind(paymentStatus, order_id)
-      .run();
+    await c.env.DB.prepare(
+      'UPDATE orders SET payment_status = ? WHERE payment_external_id = ? OR midtrans_order_id = ?'
+    ).bind(paymentStatus, result.orderId, result.orderId).run();
   }
 
   return c.json({ success: true });
 };
 
 app.post('/midtrans/notification', handleMidtransNotification);
-
-// Alias webhook untuk kompatibilitas URL
 app.post('/midtrans-webhook', handleMidtransNotification);
+
+// ------------------------------------------------------------------
+// Webhook Xendit
+//
+// Xendit mengirim header x-callback-token bila callback token dikonfigurasi di
+// Dashboard. Kalau token itu diset di sini, notifikasi yang tidak membawa
+// token yang sama akan ditolak.
+// ------------------------------------------------------------------
+app.post('/payments/notification', async (c) => {
+  const expectedToken = (await getSetting(c.env, 'XENDIT_CALLBACK_TOKEN')) || c.env.XENDIT_CALLBACK_TOKEN || '';
+  const receivedToken = c.req.header('x-callback-token') || c.req.header('x-callback-fingerprint') || '';
+
+  if (expectedToken && receivedToken !== expectedToken) {
+    return c.json({ success: false, message: 'Invalid callback token' }, 403);
+  }
+
+  const body: any = await c.req.json().catch(() => ({}));
+  const referenceId = String(body?.reference_id || body?.data?.reference_id || '');
+  const status = String(body?.status || body?.data?.status || '');
+
+  const state = (() => {
+    switch (status) {
+      case 'SUCCEEDED':
+      case 'CAPTURED':
+        return 'settlement';
+      case 'EXPIRED':
+      case 'CANCELLED':
+      case 'FAILED':
+        return 'failed';
+      default:
+        return 'pending';
+    }
+  })();
+
+  if (referenceId && state && c.env.DB) {
+    await c.env.DB.prepare(
+      "UPDATE orders SET payment_status = ? WHERE payment_provider = 'xendit' AND payment_external_id = ?"
+    ).bind(state, referenceId).run();
+  }
+
+  return c.json({ success: true });
+});
 
 // ------------------------------------------------------------------
 // GET /api/orders/:id/status
 // Dipakai frontend untuk polling status pembayaran sambil pembeli
-// menunggu di layar QR/VA. Status disinkronkan ulang dengan Midtrans supaya
-// tetap akurat walau webhook belum terdaftar di Dashboard Midtrans.
+// menunggu di layar QR/VA.
 // ------------------------------------------------------------------
 app.get('/orders/:id/status', async (c) => {
   const id = c.req.param('id');

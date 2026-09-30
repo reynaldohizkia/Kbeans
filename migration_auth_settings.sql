@@ -34,3 +34,24 @@ VALUES ('usr_admin', 'Administrator Kbeans', 'admin@kbeans.com', 'admin123', 'ad
 
 INSERT OR IGNORE INTO users (id, name, email, password, role, phone)
 VALUES ('usr_demo_cust', 'Reynaldo Pelanggan', 'pelanggan@gmail.com', 'pelanggan123', 'customer', '089876543210');
+
+-- Referensi transaksi payment gateway. `payment_provider` mencatat gateway mana
+-- yang dipakai, `payment_external_id` adalah id transaksinya di gateway itu.
+-- Dibuat generik (bukan per-gateway) supaya menukar gateway tidak butuh kolom
+-- baru. Order lama yang sudah punya midtrans_order_id ikut ditandai supaya
+-- statusnya tetap bisa dicek.
+--
+-- SQLite tidak punya "ADD COLUMN IF NOT EXISTS", jadi ketiga perintah di bawah
+-- hanya dijalankan sekali pada database yang belum punya kolom-kolom ini.
+ALTER TABLE orders ADD COLUMN payment_provider TEXT;
+ALTER TABLE orders ADD COLUMN payment_external_id TEXT;
+
+UPDATE orders
+SET payment_provider = 'midtrans',
+    payment_external_id = midtrans_order_id
+WHERE midtrans_order_id IS NOT NULL
+  AND midtrans_order_id != ''
+  AND payment_provider IS NULL;
+
+-- Kolom Midtrans lama tetap dipakai untuk kompatibilitas webhook dan proxy QR.
+ALTER TABLE orders ADD COLUMN midtrans_qr_url TEXT;

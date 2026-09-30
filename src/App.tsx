@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
-import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield, Download, Check, Copy } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { X, ShoppingBag, Minus, Plus, MapPin, Coffee, User, LogOut, Shield, Download, Check, Copy, Info } from 'lucide-react';
+import QrCanvas from './QrCanvas';
 
 // ----------------------------------------------------------------
 // Types
@@ -106,6 +107,9 @@ export default function App() {
   const [qrLoadError, setQrLoadError] = useState('');
   const [vaNumber, setVaNumber] = useState('');
   const [vaBank, setVaBank] = useState('');
+  const [qrString, setQrString] = useState('');
+  const [paymentNotes, setPaymentNotes] = useState<string[]>([]);
+  const [providerLabel, setProviderLabel] = useState('');
   const [chargeError, setChargeError] = useState('');
   const [chargeHint, setChargeHint] = useState('');
   const [paymentFailed, setPaymentFailed] = useState(false);
@@ -113,14 +117,41 @@ export default function App() {
   const [qrDownloaded, setQrDownloaded] = useState(false);
   const [copiedVa, setCopiedVa] = useState(false);
 
-  // QRIS asli dibuat oleh Midtrans dan disajikan lewat proxy /api/midtrans/qr.
-  // Karena proxy ini satu domain dengan frontend, pengunduhannya selalu berhasil
-  // tanpa masalah CORS.
+  const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Dua sumber QR, tergantung gateway:
+  //   qrString -> dirender sendiri di browser (Xendit)
+  //   qrUrl    -> gambar resmi dari gateway lewat proxy (Midtrans)
+  const hasQr = !!qrString || !!qrUrl;
+
+  // QR yang dirender sendiri di browser bisa langsung diekspor dari canvas,
+  // tanpa perlu fetch dan tanpa masalah CORS sama sekali.
+  const downloadRenderedQr = (fileName: string) => {
+    const canvas = qrCanvasRef.current;
+    if (!canvas) return false;
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    return true;
+  };
+
   const downloadQrCode = async () => {
-    if (!qrUrl || !order) return;
+    if (!hasQr || !order) return;
     setDownloadingQr(true);
 
     const fileName = `QRIS-Kbeans-${order.order_number}.png`;
+
+    if (qrString) {
+      if (downloadRenderedQr(fileName)) {
+        setDownloadingQr(false);
+        setQrDownloaded(true);
+        setTimeout(() => setQrDownloaded(false), 3000);
+      }
+      return;
+    }
 
     try {
       const res = await fetch(qrUrl);
@@ -245,15 +276,15 @@ export default function App() {
         return;
       }
 
-      // Minta transaksi Midtrans sungguhan (QRIS / Virtual Account).
-      const chargeRes = await fetch('/api/midtrans/charge', {
+      // Minta transaksi sungguhan ke payment gateway yang aktif.
+      const chargeRes = await fetch('/api/payments/charge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ order_id: data.order_id, payment_method: paymentMethod }),
       });
       const chargeData = await chargeRes.json();
 
-      // Midtrans menolak? Tampilkan error aslinya. Jangan pernah menampilkan QR
+      // Gateway menolak? Tampilkan error aslinya. Jangan pernah menampilkan QR
       // pengganti, karena QR palsu hanya bisa "dipindai" tapi tidak bisa dibayar.
       if (!chargeData.success) {
         setCheckoutStep('payment');
@@ -263,13 +294,19 @@ export default function App() {
       }
 
       setCheckoutStep('payment');
+      setProviderLabel(chargeData.provider_label || '');
+      setPaymentNotes(Array.isArray(chargeData.notes) ? chargeData.notes : []);
 
-      if (paymentMethod === 'qris' && chargeData.qr_proxy_url) {
+      // Xendit mengirim string EMVCo, Midtrans mengirim URL gambar resmi.
+      if (chargeData.qr_string) {
+        setQrString(chargeData.qr_string);
+      }
+      if (chargeData.qr_proxy_url) {
         setQrUrl(chargeData.qr_proxy_url);
       }
-      if (paymentMethod === 'bca_va' && chargeData.va_number) {
+      if (chargeData.va_number) {
         setVaNumber(chargeData.va_number);
-        setVaBank(chargeData.bank || '');
+        setVaBank(chargeData.va_bank || chargeData.bank || '');
       }
     } catch (e) {
       console.error(e);
@@ -281,7 +318,7 @@ export default function App() {
   };
 
   // Polling status pembayaran setiap 4 detik selagi menunggu di layar QR/VA.
-  // Backend menanyakan status terbaru ke Midtrans lalu menyimpannya ke D1, jadi
+  // Backend menanyakan status terbaru ke gateway lalu menyimpannya ke D1, jadi
   // halaman tetap sampai ke layar "Berhasil" walau webhook belum terdaftar.
   useEffect(() => {
     if (checkoutStep !== 'payment' || !order || paymentMethod === 'credit_card' || paymentFailed) return;
@@ -295,10 +332,11 @@ export default function App() {
           clearInterval(interval);
         } else if (data.payment_status === 'failed') {
           setPaymentFailed(true);
+          const raw = String(data.transaction_status || '').toLowerCase();
           setChargeError(
-            data.transaction_status === 'expire'
+            raw === 'expire' || raw === 'expired'
               ? 'Waktu pembayaran habis (QRIS kedaluwarsa). Silakan buat pesanan baru.'
-              : 'Pembayaran dibatalkan atau ditolak oleh Midtrans. Silakan buat pesanan baru.'
+              : 'Pembayaran dibatalkan atau ditolak oleh payment gateway. Silakan buat pesanan baru.'
           );
           clearInterval(interval);
         }
@@ -318,10 +356,13 @@ export default function App() {
     setDeliveryAddress('');
     setOrder(null);
     setQrUrl('');
+    setQrString('');
     setVaNumber('');
     setVaBank('');
     setChargeError('');
     setChargeHint('');
+    setPaymentNotes([]);
+    setProviderLabel('');
     setPaymentFailed(false);
     setQrLoadError('');
     setCartOpen(false);
@@ -627,21 +668,39 @@ export default function App() {
                     </div>
                   )}
 
+                  {paymentNotes.length > 0 && !paymentFailed && (
+                    <div className="mb-4 w-full rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-left text-xs text-amber-300">
+                      <span className="mb-0.5 flex items-center gap-1.5 font-semibold">
+                        <Info size={13} />
+                        Mode {providerLabel || 'Test'}
+                      </span>
+                      {paymentNotes.map((note) => (
+                        <span key={note} className="block">{note}</span>
+                      ))}
+                    </div>
+                  )}
+
                   {paymentMethod === 'qris' && !paymentFailed && (
                     <div className="flex flex-col items-center">
-                      {qrUrl && !qrLoadError ? (
+                      {hasQr && !qrLoadError ? (
                         <>
                           <div className="rounded-2xl bg-white p-3.5 shadow-lg">
-                            <img
-                              src={qrUrl}
-                              alt="QRIS Pembayaran"
-                              width={220}
-                              height={220}
-                              className="rounded-lg"
-                              onError={() =>
-                                setQrLoadError('Gambar QRIS gagal dimuat dari Midtrans. Muat ulang halaman untuk mencoba lagi.')
-                              }
-                            />
+                            {qrString ? (
+                              <div ref={(el) => { qrCanvasRef.current = el?.querySelector('canvas') ?? null; }}>
+                                <QrCanvas value={qrString} size={220} onError={setQrLoadError} />
+                              </div>
+                            ) : (
+                              <img
+                                src={qrUrl}
+                                alt="QRIS Pembayaran"
+                                width={220}
+                                height={220}
+                                className="rounded-lg"
+                                onError={() =>
+                                  setQrLoadError('Gambar QRIS gagal dimuat dari payment gateway. Muat ulang halaman untuk mencoba lagi.')
+                                }
+                              />
+                            )}
                           </div>
 
                           {/* Tombol Unduh / Download QR */}
@@ -725,7 +784,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {(qrUrl || vaNumber) && !paymentFailed && (
+                  {(hasQr || vaNumber) && !paymentFailed && (
                     <div className="mt-6 flex items-center gap-2 text-xs text-[#B8A896]">
                       <span className="h-2 w-2 animate-pulse rounded-full bg-[#C99A3D]" />
                       Menunggu pembayaran kamu secara otomatis...
