@@ -102,77 +102,46 @@ export default function App() {
   const [paymentMethod, setPaymentMethod] = useState<'qris' | 'bca_va' | 'credit_card'>('qris');
   const [placingOrder, setPlacingOrder] = useState(false);
   const [order, setOrder] = useState<{ order_id: string; order_number: string; total_amount: number } | null>(null);
-  const [confirmingPayment, setConfirmingPayment] = useState(false);
   const [qrUrl, setQrUrl] = useState('');
+  const [qrLoadError, setQrLoadError] = useState('');
   const [vaNumber, setVaNumber] = useState('');
+  const [vaBank, setVaBank] = useState('');
   const [chargeError, setChargeError] = useState('');
-  const [isDemoPayment, setIsDemoPayment] = useState(false);
-  const [demoReason, setDemoReason] = useState('');
+  const [chargeHint, setChargeHint] = useState('');
+  const [paymentFailed, setPaymentFailed] = useState(false);
   const [downloadingQr, setDownloadingQr] = useState(false);
   const [qrDownloaded, setQrDownloaded] = useState(false);
   const [copiedVa, setCopiedVa] = useState(false);
 
+  // QRIS asli dibuat oleh Midtrans dan disajikan lewat proxy /api/midtrans/qr.
+  // Karena proxy ini satu domain dengan frontend, pengunduhannya selalu berhasil
+  // tanpa masalah CORS.
   const downloadQrCode = async () => {
     if (!qrUrl || !order) return;
     setDownloadingQr(true);
+
     const fileName = `QRIS-Kbeans-${order.order_number}.png`;
 
     try {
-      // 1. Ambil file gambar langsung via Blob (CORS)
-      const res = await fetch(qrUrl, { mode: 'cors' });
-      if (res.ok) {
-        const blob = await res.blob();
-        const blobUrl = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = blobUrl;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(blobUrl);
-        setDownloadingQr(false);
-        setQrDownloaded(true);
-        setTimeout(() => setQrDownloaded(false), 3000);
-        return;
-      }
+      const res = await fetch(qrUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(blobUrl);
     } catch {
-      // jika fetch CORS dibatasi oleh browser, gunakan Canvas
-    }
-
-    // 2. Fallback Canvas (menggambar ulang gambar QR ke canvas lalu export ke PNG)
-    try {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth || 300;
-        canvas.height = img.naturalHeight || 300;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(img, 0, 0);
-          const dataUrl = canvas.toDataURL('image/png');
-          const a = document.createElement('a');
-          a.href = dataUrl;
-          a.download = fileName;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setQrDownloaded(true);
-          setTimeout(() => setQrDownloaded(false), 3000);
-        }
-        setDownloadingQr(false);
-      };
-      img.onerror = () => {
-        // 3. Fallback jika semua metode gagal: buka gambar di tab baru agar bisa disimpan manual
-        window.open(qrUrl, '_blank');
-        setDownloadingQr(false);
-      };
-      img.src = qrUrl;
-    } catch {
+      // QR tidak bisa diunduh sebagai file, buka di tab baru agar bisa
+      // disimpan manual lewat tombol simpan gambar di browser.
       window.open(qrUrl, '_blank');
+    } finally {
       setDownloadingQr(false);
+      setQrDownloaded(true);
+      setTimeout(() => setQrDownloaded(false), 3000);
     }
   };
 
@@ -244,8 +213,12 @@ export default function App() {
 
     setPlacingOrder(true);
     setChargeError('');
-    setIsDemoPayment(false);
-    setDemoReason('');
+    setChargeHint('');
+    setPaymentFailed(false);
+    setQrLoadError('');
+    setQrUrl('');
+    setVaNumber('');
+    setVaBank('');
     try {
       const res = await fetch('/api/orders', {
         method: 'POST',
@@ -266,13 +239,13 @@ export default function App() {
       }
 
       setOrder({ order_id: data.order_id, order_number: data.order_number, total_amount: data.total_amount });
-      setCheckoutStep('payment');
 
       if (paymentMethod === 'credit_card') {
+        setCheckoutStep('payment');
         return;
       }
 
-      // Panggil Midtrans Core API untuk QRIS / Virtual Account
+      // Minta transaksi Midtrans sungguhan (QRIS / Virtual Account).
       const chargeRes = await fetch('/api/midtrans/charge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -280,35 +253,39 @@ export default function App() {
       });
       const chargeData = await chargeRes.json();
 
+      // Midtrans menolak? Tampilkan error aslinya. Jangan pernah menampilkan QR
+      // pengganti, karena QR palsu hanya bisa "dipindai" tapi tidak bisa dibayar.
       if (!chargeData.success) {
+        setCheckoutStep('payment');
         setChargeError(chargeData.message || 'Gagal memproses pembayaran.');
+        setChargeHint(chargeData.hint || '');
         return;
       }
 
-      if (chargeData.is_demo) {
-        setIsDemoPayment(true);
-        setDemoReason(chargeData.demo_reason || '');
-      }
+      setCheckoutStep('payment');
 
-      if (paymentMethod === 'qris' && chargeData.qr_url) {
-        setQrUrl(chargeData.qr_url);
+      if (paymentMethod === 'qris' && chargeData.qr_proxy_url) {
+        setQrUrl(chargeData.qr_proxy_url);
       }
       if (paymentMethod === 'bca_va' && chargeData.va_number) {
         setVaNumber(chargeData.va_number);
+        setVaBank(chargeData.bank || '');
       }
     } catch (e) {
       console.error(e);
-      setChargeError('Terjadi kesalahan jaringan.');
+      setCheckoutStep('payment');
+      setChargeError('Terjadi kesalahan jaringan saat membuat pembayaran.');
     } finally {
       setPlacingOrder(false);
     }
   };
 
-  // Polling status pembayaran setiap 4 detik selagi menunggu di layar QR/VA,
-  // supaya begitu pembeli benar-benar bayar (webhook Midtrans masuk),
-  // halaman otomatis pindah ke layar sukses tanpa perlu tombol manual.
+  // Polling status pembayaran setiap 4 detik selagi menunggu di layar QR/VA.
+  // Backend menanyakan status terbaru ke Midtrans lalu menyimpannya ke D1, jadi
+  // halaman tetap sampai ke layar "Berhasil" walau webhook belum terdaftar.
   useEffect(() => {
-    if (checkoutStep !== 'payment' || !order || paymentMethod === 'credit_card') return;
+    if (checkoutStep !== 'payment' || !order || paymentMethod === 'credit_card' || paymentFailed) return;
+
     const interval = setInterval(async () => {
       try {
         const res = await fetch(`/api/orders/${order.order_id}/status`);
@@ -316,32 +293,22 @@ export default function App() {
         if (data.payment_status === 'settlement') {
           setCheckoutStep('success');
           clearInterval(interval);
+        } else if (data.payment_status === 'failed') {
+          setPaymentFailed(true);
+          setChargeError(
+            data.transaction_status === 'expire'
+              ? 'Waktu pembayaran habis (QRIS kedaluwarsa). Silakan buat pesanan baru.'
+              : 'Pembayaran dibatalkan atau ditolak oleh Midtrans. Silakan buat pesanan baru.'
+          );
+          clearInterval(interval);
         }
       } catch {
         /* diamkan, coba lagi di interval berikutnya */
       }
     }, 4000);
-    return () => clearInterval(interval);
-  }, [checkoutStep, order, paymentMethod]);
 
-  // Jalur cadangan sementara selagi menunggu aktivasi channel Midtrans --
-  // menandai pesanan lunas secara manual tanpa lewat Midtrans sungguhan.
-  const confirmPayment = async () => {
-    if (!order) return;
-    setConfirmingPayment(true);
-    try {
-      await fetch('/api/midtrans/simulate-payment', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: order.order_id }),
-      });
-      setCheckoutStep('success');
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setConfirmingPayment(false);
-    }
-  };
+    return () => clearInterval(interval);
+  }, [checkoutStep, order, paymentMethod, paymentFailed]);
 
   const resetCheckout = () => {
     setCart([]);
@@ -352,9 +319,11 @@ export default function App() {
     setOrder(null);
     setQrUrl('');
     setVaNumber('');
+    setVaBank('');
     setChargeError('');
-    setIsDemoPayment(false);
-    setDemoReason('');
+    setChargeHint('');
+    setPaymentFailed(false);
+    setQrLoadError('');
     setCartOpen(false);
   };
 
@@ -651,21 +620,16 @@ export default function App() {
                   <p className="mb-6 font-serif text-lg text-[#F0E6D8]">{order.order_number}</p>
 
                   {chargeError && (
-                    <div className="mb-4 w-full rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-400">
-                      {chargeError}
+                    <div className="mb-4 w-full rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-left text-xs text-red-400">
+                      <p className="font-semibold">Pembayaran tidak dapat diproses</p>
+                      <p className="mt-0.5 break-words">{chargeError}</p>
+                      {chargeHint && <p className="mt-1 text-[#B8A896]">{chargeHint}</p>}
                     </div>
                   )}
 
-                  {isDemoPayment && (
-                    <div className="mb-4 w-full rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-left text-xs text-amber-300">
-                      <span className="block font-semibold">ℹ️ Mode Demo QRIS Aktif</span>
-                      <span>{demoReason || 'Berjalan dalam mode simulasi demo.'}</span>
-                    </div>
-                  )}
-
-                  {paymentMethod === 'qris' && (
+                  {paymentMethod === 'qris' && !paymentFailed && (
                     <div className="flex flex-col items-center">
-                      {qrUrl ? (
+                      {qrUrl && !qrLoadError ? (
                         <>
                           <div className="rounded-2xl bg-white p-3.5 shadow-lg">
                             <img
@@ -674,13 +638,9 @@ export default function App() {
                               width={220}
                               height={220}
                               className="rounded-lg"
-                              crossOrigin="anonymous"
-                              onError={(e) => {
-                                const target = e.target as HTMLImageElement;
-                                if (!target.src.includes('api.qrserver.com')) {
-                                  target.src = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=KB-${order.order_number}`;
-                                }
-                              }}
+                              onError={() =>
+                                setQrLoadError('Gambar QRIS gagal dimuat dari Midtrans. Muat ulang halaman untuk mencoba lagi.')
+                              }
                             />
                           </div>
 
@@ -705,24 +665,41 @@ export default function App() {
                               )}
                             </button>
                             <p className="max-w-[270px] text-center text-[11px] text-[#B8A896]">
-                              Simpan ke galeri untuk bayar via fitur scan foto di BCA mobile, GoPay, OVO, ShopeePay, atau DANA.
+                              Simpan ke galeri untuk bayar lewat fitur scan foto di GoPay, OVO, DANA, ShopeePay, atau m-banking apa pun.
                             </p>
                           </div>
                         </>
                       ) : (
-                        <div className="flex h-56 w-56 flex-col items-center justify-center rounded-xl border border-dashed border-[#3A2A1E] bg-[#1C1410]">
-                          <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-[#C99A3D] border-t-transparent" />
-                          <p className="text-xs text-[#B8A896]">Menyiapkan kode QRIS...</p>
+                        <div className="flex h-56 w-56 flex-col items-center justify-center rounded-xl border border-dashed border-[#3A2A1E] bg-[#1C1410] p-4 text-center">
+                          {qrLoadError ? (
+                            <>
+                              <p className="text-xs text-red-400">{qrLoadError}</p>
+                              <button
+                                type="button"
+                                onClick={() => window.location.reload()}
+                                className="mt-3 rounded-full border border-[#C99A3D] px-4 py-1.5 text-[11px] text-[#C99A3D]"
+                              >
+                                Muat Ulang
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-[#C99A3D] border-t-transparent" />
+                              <p className="text-xs text-[#B8A896]">Menyiapkan kode QRIS...</p>
+                            </>
+                          )}
                         </div>
                       )}
                     </div>
                   )}
 
-                  {paymentMethod === 'bca_va' && (
+                  {paymentMethod === 'bca_va' && !paymentFailed && (
                     <div className="w-full">
                       {vaNumber ? (
                         <div className="w-full rounded-xl border border-[#3A2A1E] bg-[#1C1410] p-5 text-center">
-                          <p className="text-xs text-[#B8A896]">Nomor Virtual Account BCA</p>
+                          <p className="text-xs text-[#B8A896]">
+                            Nomor Virtual Account{vaBank ? ` ${vaBank.toUpperCase()}` : ''}
+                          </p>
                           <p className="mt-1 font-mono text-xl font-bold tracking-wider text-[#F0E6D8]">{vaNumber}</p>
                           <button
                             type="button"
@@ -748,7 +725,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {(qrUrl || vaNumber) && (
+                  {(qrUrl || vaNumber) && !paymentFailed && (
                     <div className="mt-6 flex items-center gap-2 text-xs text-[#B8A896]">
                       <span className="h-2 w-2 animate-pulse rounded-full bg-[#C99A3D]" />
                       Menunggu pembayaran kamu secara otomatis...
@@ -856,16 +833,26 @@ export default function App() {
 
             {checkoutStep === 'payment' && paymentMethod !== 'credit_card' && (
               <div className="space-y-3 border-t border-[#3A2A1E] px-6 py-5">
-                <button
-                  onClick={confirmPayment}
-                  disabled={confirmingPayment}
-                  className="w-full rounded-full bg-[#C99A3D] py-3 text-sm font-medium text-[#1C1410] transition hover:bg-[#DBAE55] disabled:opacity-50"
-                >
-                  {confirmingPayment ? 'Memproses...' : 'Simulasikan Pembayaran Berhasil'}
-                </button>
-                <p className="text-center text-[11px] text-[#8A7A68]">
-                  * Mode cadangan sementara -- dipakai selagi menunggu aktivasi channel Midtrans.
-                </p>
+                {paymentFailed ? (
+                  <button
+                    onClick={resetCheckout}
+                    className="w-full rounded-full bg-[#C99A3D] py-3 text-sm font-medium text-[#1C1410] transition hover:bg-[#DBAE55]"
+                  >
+                    Buat Pesanan Baru
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => setCheckoutStep('form')}
+                      className="w-full rounded-full border border-[#3A2A1E] py-3 text-sm text-[#B8A896] transition hover:border-[#C99A3D] hover:text-[#C99A3D]"
+                    >
+                      Ganti Metode Pembayaran
+                    </button>
+                    <p className="text-center text-[11px] text-[#8A7A68]">
+                      Status pembayaran dicek langsung ke Midtrans. Jangan tutup halaman ini sebelum pembayaran selesai.
+                    </p>
+                  </>
+                )}
               </div>
             )}
 

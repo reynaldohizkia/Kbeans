@@ -29,8 +29,18 @@ export default function AdminPanel() {
 
   // State Modal Pengaturan Midtrans
   const [showConfigModal, setShowConfigModal] = useState(false);
-  const [midtransConfig, setMidtransConfig] = useState<{ has_key: boolean; masked_key: string; source: string } | null>(null);
+  const [midtransConfig, setMidtransConfig] = useState<{
+    has_key: boolean;
+    masked_key: string;
+    source: string;
+    mode: 'production' | 'sandbox';
+    mode_source: string;
+    base_url: string;
+    acquirer: string;
+  } | null>(null);
   const [serverKeyInput, setServerKeyInput] = useState('');
+  const [modeInput, setModeInput] = useState<'production' | 'sandbox'>('production');
+  const [acquirerInput, setAcquirerInput] = useState<'gopay' | 'airpay shopee'>('gopay');
   const [savingKey, setSavingKey] = useState(false);
   const [configMsg, setConfigMsg] = useState('');
   const [configErr, setConfigErr] = useState('');
@@ -132,6 +142,8 @@ export default function AdminPanel() {
       const data = await res.json();
       if (data.success) {
         setMidtransConfig(data);
+        setModeInput(data.mode === 'sandbox' ? 'sandbox' : 'production');
+        setAcquirerInput(data.acquirer === 'airpay shopee' ? 'airpay shopee' : 'gopay');
       }
     } catch {}
   };
@@ -153,7 +165,11 @@ export default function AdminPanel() {
       const res = await fetch('/api/admin/midtrans/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
-        body: JSON.stringify({ server_key: serverKeyInput }),
+        body: JSON.stringify({
+          server_key: serverKeyInput,
+          mode: modeInput,
+          qris_acquirer: acquirerInput,
+        }),
       });
       const data = await res.json();
       if (!data.success) {
@@ -304,7 +320,7 @@ export default function AdminPanel() {
               <div className="flex items-center justify-between border-b border-[#3A2A1E] pb-4">
                 <div className="flex items-center gap-2">
                   <Key size={18} className="text-[#C99A3D]" />
-                  <h2 className="font-serif text-lg text-[#F0E6D8]">Integrasi Midtrans (Sandbox)</h2>
+                  <h2 className="font-serif text-lg text-[#F0E6D8]">Integrasi Midtrans</h2>
                 </div>
                 <button onClick={() => setShowConfigModal(false)} className="text-[#B8A896] hover:text-[#F0E6D8]">
                   <X size={18} />
@@ -319,19 +335,30 @@ export default function AdminPanel() {
                     <div className="mt-2 flex items-start gap-2 text-emerald-400">
                       <ShieldCheck size={16} className="mt-0.5 shrink-0" />
                       <div>
-                        <p className="font-medium text-emerald-300">Terhubung ke Midtrans Sandbox</p>
+                        <p className="font-medium text-emerald-300">
+                          Terhubung ke Midtrans {midtransConfig.mode === 'production' ? 'Production' : 'Sandbox'}
+                        </p>
                         <p className="text-[11px] text-[#B8A896]">
                           Server Key: <code className="font-mono text-[#F0E6D8]">{midtransConfig.masked_key}</code> ({midtransConfig.source})
                         </p>
+                        <p className="mt-0.5 text-[11px] text-[#8A7A68]">
+                          Endpoint: <code className="font-mono">{midtransConfig.base_url}</code> &middot; mode {midtransConfig.mode_source}
+                        </p>
+                        {midtransConfig.mode === 'production' && (
+                          <p className="mt-1 text-[11px] font-medium text-amber-300">
+                            QRIS di mode ini memakai uang sungguhan.
+                          </p>
+                        )}
                       </div>
                     </div>
                   ) : (
                     <div className="mt-2 flex items-start gap-2 text-amber-400">
                       <AlertCircle size={16} className="mt-0.5 shrink-0" />
                       <div>
-                        <p className="font-medium text-amber-300">Belum Terhubung (Mode Demo Simulasi)</p>
+                        <p className="font-medium text-amber-300">Belum Terhubung</p>
                         <p className="text-[11px] text-[#B8A896]">
-                          Masukkan Server Key Midtrans di bawah ini untuk mengaktifkan QRIS dan VA Midtrans nyata.
+                          Masukkan Server Key Midtrans di bawah ini. Tanpa Server Key, QRIS dan Virtual Account tidak
+                          bisa dibuat sama sekali.
                         </p>
                       </div>
                     </div>
@@ -348,11 +375,60 @@ export default function AdminPanel() {
                       type="text"
                       value={serverKeyInput}
                       onChange={(e) => setServerKeyInput(e.target.value)}
-                      placeholder="Contoh: SB-Mid-server-xxxxxxxxxxxx"
+                      placeholder="SK-Mid-server-xxxxxxxx (Production) atau SB-Mid-server-xxxxxxxx (Sandbox)"
                       className="w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3.5 py-2.5 font-mono text-xs text-[#F0E6D8] outline-none transition focus:border-[#C99A3D]"
                     />
                     <p className="mt-1 text-[11px] text-[#8A7A68]">
-                      Salin dari Dashboard Midtrans &gt; <strong>Settings &gt; Access Keys &gt; Server Key</strong>
+                      Salin dari Dashboard Midtrans &gt; <strong>Settings &gt; Access Keys</strong>. Environment
+                      terdeteksi otomatis dari awalan key, jadi key <code className="font-mono">SK-</code> memakai
+                      api.midtrans.com dan <code className="font-mono">SB-</code> memakai sandbox.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block font-medium text-[#F0E6D8]">Environment</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(['production', 'sandbox'] as const).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => setModeInput(m)}
+                          className={`rounded-lg border px-3 py-2 text-xs font-medium capitalize transition ${
+                            modeInput === m
+                              ? 'border-[#C99A3D] bg-[#C99A3D]/15 text-[#C99A3D]'
+                              : 'border-[#3A2A1E] bg-[#1C1410] text-[#B8A896] hover:border-[#C99A3D]/50'
+                          }`}
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mt-1 text-[11px] text-[#8A7A68]">
+                      Dipakai hanya bila awalan Server Key tidak dikenali.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block font-medium text-[#F0E6D8]">Acquirer QRIS</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(['gopay', 'airpay shopee'] as const).map((a) => (
+                        <button
+                          key={a}
+                          type="button"
+                          onClick={() => setAcquirerInput(a)}
+                          className={`rounded-lg border px-3 py-2 text-xs font-medium capitalize transition ${
+                            acquirerInput === a
+                              ? 'border-[#C99A3D] bg-[#C99A3D]/15 text-[#C99A3D]'
+                              : 'border-[#3A2A1E] bg-[#1C1410] text-[#B8A896] hover:border-[#C99A3D]/50'
+                          }`}
+                        >
+                          {a}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mt-1 text-[11px] text-[#8A7A68]">
+                      Midtrans hanya bisa membuat QRIS lewat acquirer yang sudah diaktifkan di
+                      Dashboard &gt; <strong>Settings &gt; Payment Methods</strong>. Pilih sesuai akun Anda.
                     </p>
                   </div>
 
