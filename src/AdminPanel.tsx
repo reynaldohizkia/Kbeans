@@ -85,22 +85,12 @@ export default function AdminPanel() {
   };
 
   // Cek apakah sudah login sebagai admin via halaman /login
-  const userStr = localStorage.getItem('kbeans_user');
-  const userObj = userStr ? (() => { try { return JSON.parse(userStr); } catch { return null; } })() : null;
-
-  // Jika adminKey tidak ada (belum login lewat halaman login baru),
-  // tapi user di localStorage adalah admin, maka gunakan token demo
-  useEffect(() => {
-    if (!adminKey && userObj?.role === 'admin') {
-      const demoToken = 'kbeans_admin_token';
-      localStorage.setItem('kbeans_admin_key', demoToken);
-      setAdminKey(demoToken);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Token admin hanya disimpan localStorage oleh halaman /login setelah
+  // autentikasi berhasil. Dulu ada token demo yang ditulis di source code,
+  // sehingga siapa pun yang membaca repo bisa mengakses API admin.
 
   // ---------- Redirect ke /login jika belum login ----------
-  if (!adminKey && userObj?.role !== 'admin') {
+  if (!adminKey) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center bg-[#1C1410] px-4 font-sans text-[#F0E6D8]">
         <div className="mb-6 flex flex-col items-center gap-3 text-center">

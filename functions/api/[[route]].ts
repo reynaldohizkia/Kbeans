@@ -123,12 +123,25 @@ app.get('/categories', async (c) => {
   return c.json({ success: true, data: [] });
 });
 
-// Helper verifikasi akses admin (menerima key Cloudflare atau token admin bawaan)
-const verifyAdminAccess = (key: string | undefined, envAdminKey: string | undefined) => {
-  if (!key) return false;
-  if (envAdminKey && key === envAdminKey) return true;
-  if (key === 'kbeans_admin_token' || key === 'admin123') return true;
-  return false;
+// Token admin diturunkan dari secret ADMIN_KEY, bukan secret-nya sendiri,
+// sehingga secret asli tidak pernah dikirim ke browser. Nilai token ini juga
+// tidak ditulis di source code: yang tertulis di repo tidak cukup untuk
+// mengakses API admin.
+const deriveAdminToken = async (secret: string): Promise<string> => {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`kbeans-admin-token:${secret}`)
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+// Verifikasi akses admin. Hanya menerima token hasil derivasi dari ADMIN_KEY.
+// Kalau ADMIN_KEY belum diset di Cloudflare, semua akses admin ditolak.
+const verifyAdminAccess = async (key: string | undefined, envAdminKey: string | undefined) => {
+  if (!key || !envAdminKey) return false;
+  return key === await deriveAdminToken(envAdminKey);
 };
 
 // Nama tabel yang wajib ada sebelum route auth / admin bisa bekerja. Tabelnya
@@ -359,8 +372,16 @@ app.post('/auth/login', async (c) => {
               .run();
           }
 
+          if (user.role === 'admin' && !c.env.ADMIN_KEY) {
+            return c.json({
+              success: false,
+              message: 'ADMIN_KEY belum diset di Cloudflare Pages, jadi login admin dinonaktifkan. '
+                + 'Set environment variable ADMIN_KEY, lalu deploy ulang.',
+            }, 503);
+          }
+
           const token = user.role === 'admin'
-            ? (c.env.ADMIN_KEY || 'kbeans_admin_token')
+            ? await deriveAdminToken(c.env.ADMIN_KEY as string)
             : `token_${user.id}_${Date.now()}`;
 
           return c.json({
@@ -448,7 +469,7 @@ app.post('/auth/register', async (c) => {
 // ------------------------------------------------------------------
 app.get('/admin/orders', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
@@ -468,7 +489,7 @@ app.get('/admin/orders', async (c) => {
 // ------------------------------------------------------------------
 app.patch('/admin/orders/:id/status', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
@@ -488,7 +509,7 @@ app.patch('/admin/orders/:id/status', async (c) => {
 // ------------------------------------------------------------------
 app.get('/admin/midtrans/config', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
@@ -538,7 +559,7 @@ const verifyServerKey = async (baseUrl: string, serverKey: string) => {
 // ------------------------------------------------------------------
 app.post('/admin/midtrans/config', async (c) => {
   const key = c.req.header('x-admin-key');
-  if (!verifyAdminAccess(key, c.env.ADMIN_KEY)) {
+  if (!(await verifyAdminAccess(key, c.env.ADMIN_KEY))) {
     return c.json({ success: false, message: 'Unauthorized' }, 401);
   }
 
