@@ -86,22 +86,32 @@ const resolveConfig = async (env: Env): Promise<ResolvedConfig> => {
   };
 };
 
-/** Hanya memvalidasi kredensial, tidak membuat transaksi apa pun. */
-const verifyAgainst = async (mode: Mode, key: string): Promise<{ valid: boolean; detail: string }> => {
-  const headers = { Accept: 'application/json', Authorization: authHeader(key) };
-  const listRes = await fetch(`${BASE_URL[mode]}/v2/transactions?page=1&limit=1`, { headers });
-  if (listRes.status === 401 || listRes.status === 403) {
-    return { valid: false, detail: `HTTP ${listRes.status}` };
-  }
-  if (listRes.ok) return { valid: true, detail: '' };
+type KeyCheck =
+  | { result: 'valid' }
+  | { result: 'rejected'; detail: string }
+  | { result: 'inconclusive'; detail: string };
 
-  // Sebagian tipe akun tidak punya akses daftar transaksi; endpoint status
-  // dipakai sebagai gantinya, dan di sini 404 justru tanda kredensial benar.
+/**
+ * Hanya memvalidasi kredensial, tidak membuat transaksi apa pun.
+ *
+ * Hasil dibedakan jadi tiga, bukan true/false. Awalnya endpoint daftar
+ * transaksi dipakai, tapi api.midtrans.com kadang membalas 503 untuk
+ * production. Kalau status 5xx dianggap "berhasil", mode bisa terkunci ke
+ * environment yang salah tanpa pernah benar-benar diuji.
+ */
+const verifyAgainst = async (mode: Mode, key: string): Promise<KeyCheck> => {
+  const headers = { Accept: 'application/json', Authorization: authHeader(key) };
+
+  // Endpoint status dipakai sebagai penentu: 401/403 berarti key ditolak,
+  // 2xx berarti autentikasi berhasil, selain itu tidak bisa disimpulkan.
   const statusRes = await fetch(`${BASE_URL[mode]}/v2/kbeans-key-check/status`, { headers });
   if (statusRes.status === 401 || statusRes.status === 403) {
-    return { valid: false, detail: `HTTP ${statusRes.status}` };
+    return { result: 'rejected', detail: `HTTP ${statusRes.status}` };
   }
-  return { valid: true, detail: '' };
+  if (statusRes.ok) return { result: 'valid' };
+
+  // 5xx / timeout: jangan dianggap autentikasi berhasil.
+  return { result: 'inconclusive', detail: `HTTP ${statusRes.status}` };
 };
 
 const mapStatus = (transactionStatus: string | undefined): PaymentState | null => {
@@ -137,33 +147,75 @@ export const midtransProvider: PaymentProvider = {
     return { mode: cfg.mode, baseUrl: cfg.baseUrl, source: cfg.modeSource, verified: cfg.verified };
   },
 
-  async verifyKey(_env, key, opts) {
+  /**
+   * Memvalidasi credential lalu MENYIMPAN environment hasilnya.
+   *
+   * Menyimpan mode di sini penting: kalau mode hanya dicek tapi tidak ditulis,
+   * nilai lama di database ikut terpakai. Karena fingerprint cocok, config akan
+   * memakai mode lama itu dan seluruh transaksi diarahkan ke environment yang
+   * salah.
+   */
+  async verifyKey(env, key, opts) {
     const requested: Mode = String(opts?.mode).toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
     const detected = detectMode(key);
-    const order: Mode[] = detected ? [detected, detected === 'production' ? 'sandbox' : 'production'] : [requested, requested === 'production' ? 'sandbox' : 'production'];
+    const first = detected || requested;
+    const order: Mode[] = [first, first === 'production' ? 'sandbox' : 'production'];
 
     const rejections: string[] = [];
+    const inconclusive: string[] = [];
+
     for (const mode of order) {
-      const check = await verifyAgainst(mode, key);
-      if (check.valid) {
-        const notes: string[] = [];
-        if (detected && detected !== mode) {
-          notes.push(
-            `Awalan key terlihat seperti ${detected}, tapi Midtrans hanya menerimanya di ${mode.toUpperCase()}. Mode disesuaikan otomatis.`
-          );
-        }
-        if (mode === 'sandbox') {
-          notes.push('Mode SANDBOX: transaksi tidak memakai uang asli dan hanya bisa disimulasikan lewat Midtrans Payment Simulator.');
-        }
-        return { ok: true, detail: '', mode, notes };
+      let check: KeyCheck;
+      try {
+        check = await verifyAgainst(mode, key);
+      } catch (err: any) {
+        inconclusive.push(`${mode} (${err?.message || 'Network error'})`);
+        continue;
       }
-      rejections.push(`${mode} (${check.detail})`);
+
+      if (check.result === 'rejected') {
+        rejections.push(`${mode} (${check.detail})`);
+        continue;
+      }
+      if (check.result === 'inconclusive') {
+        inconclusive.push(`${mode} (${check.detail})`);
+        continue;
+      }
+
+      // Environment ini benar-benar menerima key ini.
+      await setSetting(env, MODE_SETTING, mode);
+      await setSetting(env, VERIFIED_FINGERPRINT, await sha256Hex(key));
+
+      const acquirer = String(opts?.qris_acquirer || '').trim().toLowerCase();
+      if ((ACQUIRERS as readonly string[]).includes(acquirer)) {
+        await setSetting(env, ACQUIRER_SETTING, acquirer);
+      }
+
+      const notes: string[] = [];
+      if (detected && detected !== mode) {
+        notes.push(
+          `Awalan key terlihat seperti ${detected}, tapi Midtrans hanya menerimanya di ${mode.toUpperCase()}. `
+          + 'Mode sudah disesuaikan otomatis.'
+        );
+      }
+      if (mode === 'sandbox') {
+        notes.push('Mode SANDBOX: transaksi tidak memakai uang asli dan hanya bisa disimulasikan lewat Midtrans Payment Simulator.');
+      }
+      return { ok: true, detail: '', mode, notes };
     }
 
     return {
       ok: false,
       detail: rejections.join(', '),
-      notes: ['Midtrans menolak Server Key ini di kedua environment. Salin ulang dari Dashboard > Settings > Access Keys.'],
+      notes: rejections.length
+        ? [
+            'Midtrans menolak Server Key ini di kedua environment. Salin ulang dari Dashboard > Settings > Access Keys.',
+            rejections.join(', '),
+          ]
+        : [
+            `Tidak bisa memverifikasi Server Key karena Midtrans tidak merespons normal (${inconclusive.join(', ')}). `
+            + 'Mode lama dipertahankan. Coba lagi beberapa saat lagi.',
+          ],
     };
   },
 
@@ -319,31 +371,4 @@ export const midtransProvider: PaymentProvider = {
     }
   },
 
-  /** Dipanggil route Panel Admin setelah verifikasi berhasil. */
-  async persistVerified(env: Env, key: string, opts: Record<string, any>) {
-    const requested: Mode = String(opts?.mode).toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
-    const detected = detectMode(key);
-    const order: Mode[] = detected ? [detected, detected === 'production' ? 'sandbox' : 'production'] : [requested, requested === 'production' ? 'sandbox' : 'production'];
-
-    for (const mode of order) {
-      const check = await verifyAgainst(mode, key);
-      if (!check.valid) continue;
-
-      const envKey = (env.MIDTRANS_SERVER_KEY || '').trim();
-      // Key dari form hanya disimpan kalau tidak ada key di env Cloudflare,
-      // karena env var selalu menang saat dibaca.
-      if (!envKey || key !== envKey) {
-        await setSetting(env, KEY_SETTING, key);
-      }
-      await setSetting(env, MODE_SETTING, mode);
-
-      const acquirer = String(opts?.qris_acquirer || '').trim().toLowerCase();
-      if ((ACQUIRERS as readonly string[]).includes(acquirer)) {
-        await setSetting(env, ACQUIRER_SETTING, acquirer);
-      }
-      await setSetting(env, VERIFIED_FINGERPRINT, await sha256Hex(key));
-      return mode;
-    }
-    return null;
-  },
-} as PaymentProvider & { persistVerified: (env: Env, key: string, opts: Record<string, any>) => Promise<Mode | null> };
+};
