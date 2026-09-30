@@ -516,6 +516,9 @@ const verifyServerKey = async (baseUrl: string, serverKey: string) => {
 // POST /api/admin/midtrans/config
 // Simpan dan uji Server Key Midtrans langsung dari panel admin.
 // Environment (production/sandbox) ditentukan otomatis dari prefix Server Key.
+//
+// server_key boleh dikosongkan kalau key sudah ada: dipakai untuk menyimpan
+// mode / acquirer saja tanpa mengetik ulang kunci yang sudah jalan.
 // ------------------------------------------------------------------
 app.post('/admin/midtrans/config', async (c) => {
   const key = c.req.header('x-admin-key');
@@ -524,11 +527,17 @@ app.post('/admin/midtrans/config', async (c) => {
   }
 
   const { server_key, mode, qris_acquirer } = await c.req.json();
-  if (!server_key || !String(server_key).trim()) {
+  const typedKey = String(server_key || '').trim();
+
+  let current = await getMidtransConfig(c.env);
+  if (!typedKey && !current.serverKey) {
     return c.json({ success: false, message: 'Server Key tidak boleh kosong' }, 400);
   }
 
-  const cleanKey = String(server_key).trim();
+  // Key dari Cloudflare Environment selalu menang atas key di database, jadi
+  // simpan key baru hanya kalau diketik di form DAN key env var tidak ada.
+  const envManaged = !!(c.env.MIDTRANS_SERVER_KEY || '').trim();
+  const cleanKey = typedKey || current.serverKey;
   const detectedMode = detectModeFromServerKey(cleanKey);
   const requestedMode: MidtransMode = String(mode).toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
   const effectiveMode: MidtransMode = detectedMode || requestedMode;
@@ -556,18 +565,24 @@ app.post('/admin/midtrans/config', async (c) => {
     // berikutnya akan memberi tahu jika kredensialnya benar-benar salah.
   }
 
-  await setSetting(c.env, 'MIDTRANS_SERVER_KEY', cleanKey);
+  if (typedKey && !envManaged) {
+    await setSetting(c.env, 'MIDTRANS_SERVER_KEY', typedKey);
+  }
   await setSetting(c.env, 'MIDTRANS_MODE', effectiveMode);
   await setSetting(c.env, 'MIDTRANS_QRIS_ACQUIRER', acquirer);
 
+  current = await getMidtransConfig(c.env);
+
   return c.json({
     success: true,
-    message: `Server Key tersimpan. QRIS & Virtual Account aktif di environment ${effectiveMode.toUpperCase()} (${baseUrl}).`,
-    masked_key: maskSecret(cleanKey),
-    mode: effectiveMode,
-    mode_source: detectedMode ? 'deteksi otomatis dari Server Key' : 'pengaturan manual',
-    base_url: baseUrl,
-    acquirer,
+    message: `Pengaturan tersimpan. QRIS & Virtual Account aktif di environment ${current.mode.toUpperCase()} (${current.baseUrl}), acquirer: ${current.acquirer}.`,
+    masked_key: maskSecret(current.serverKey),
+    mode: current.mode,
+    mode_source: current.modeSource,
+    base_url: current.baseUrl,
+    acquirer: current.acquirer,
+    key_source: current.keySource,
+    env_managed: envManaged,
   });
 });
 

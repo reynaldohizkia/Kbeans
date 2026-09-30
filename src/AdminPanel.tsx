@@ -157,7 +157,7 @@ export default function AdminPanel() {
 
   const handleSaveMidtransKey = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!serverKeyInput.trim()) return;
+    if (!serverKeyInput.trim() && !midtransConfig?.has_key) return;
     setSavingKey(true);
     setConfigMsg('');
     setConfigErr('');
@@ -166,7 +166,7 @@ export default function AdminPanel() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
         body: JSON.stringify({
-          server_key: serverKeyInput,
+          server_key: serverKeyInput.trim(),
           mode: modeInput,
           qris_acquirer: acquirerInput,
         }),
@@ -375,13 +375,27 @@ export default function AdminPanel() {
                       type="text"
                       value={serverKeyInput}
                       onChange={(e) => setServerKeyInput(e.target.value)}
-                      placeholder="SK-Mid-server-xxxxxxxx (Production) atau SB-Mid-server-xxxxxxxx (Sandbox)"
+                      placeholder={
+                        midtransConfig?.has_key
+                          ? `Sudah aktif: ${midtransConfig.masked_key} — biarkan kosong bila tidak ingin mengganti`
+                          : 'SK-Mid-server-xxxxxxxx (Production) atau SB-Mid-server-xxxxxxxx (Sandbox)'
+                      }
                       className="w-full rounded-lg border border-[#3A2A1E] bg-[#1C1410] px-3.5 py-2.5 font-mono text-xs text-[#F0E6D8] outline-none transition focus:border-[#C99A3D]"
                     />
                     <p className="mt-1 text-[11px] text-[#8A7A68]">
-                      Salin dari Dashboard Midtrans &gt; <strong>Settings &gt; Access Keys</strong>. Environment
-                      terdeteksi otomatis dari awalan key, jadi key <code className="font-mono">SK-</code> memakai
-                      api.midtrans.com dan <code className="font-mono">SB-</code> memakai sandbox.
+                      {midtransConfig?.source === 'Cloudflare Environment' ? (
+                        <>
+                          Key ini disimpan di Cloudflare Environment variables, jadi environment
+                          Variables di dashboard Cloudflare yang mengaturnya — nilai di sini tidak
+                          menimpanya. Gunakan form ini untuk memilih acquirer QRIS.
+                        </>
+                      ) : (
+                        <>
+                          Salin dari Dashboard Midtrans &gt; <strong>Settings &gt; Access Keys</strong>. Environment
+                          terdeteksi otomatis dari awalan key, jadi key <code className="font-mono">SK-</code> memakai
+                          api.midtrans.com dan <code className="font-mono">SB-</code> memakai sandbox.
+                        </>
+                      )}
                     </p>
                   </div>
 
@@ -445,10 +459,14 @@ export default function AdminPanel() {
 
                   <button
                     type="submit"
-                    disabled={savingKey || !serverKeyInput.trim()}
+                    disabled={savingKey || (!serverKeyInput.trim() && !midtransConfig?.has_key)}
                     className="w-full rounded-full bg-[#C99A3D] py-2.5 text-xs font-semibold text-[#1C1410] transition hover:bg-[#DBAE55] disabled:opacity-50"
                   >
-                    {savingKey ? 'Memverifikasi ke Midtrans...' : 'Simpan & Uji Server Key'}
+                    {savingKey
+                      ? 'Memverifikasi ke Midtrans...'
+                      : serverKeyInput.trim()
+                        ? 'Simpan & Uji Server Key'
+                        : 'Simpan Pengaturan'}
                   </button>
                 </form>
 
